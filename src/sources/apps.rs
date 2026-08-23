@@ -1,15 +1,12 @@
 use crate::domain::{Item, to_wide};
-use crate::search::pinyin_abbr;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 use windows::core::*;
 
-/// Each scan thread joins the MTA and uninitializes on exit.
 fn scoped_com<T>(f: impl FnOnce() -> T) -> T {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -21,7 +18,6 @@ fn scoped_com<T>(f: impl FnOnce() -> T) -> T {
     r
 }
 
-/// App discovery: Start Menu + Desktop + Admin Tools + UWP + %PATH% + App Paths.
 pub fn scan_all() -> Vec<Item> {
     let (startmenu, uwp, path_apps, app_paths) = std::thread::scope(|s| {
         let b = s.spawn(|| scoped_com(scan_start_menu_and_desktop));
@@ -37,10 +33,10 @@ pub fn scan_all() -> Vec<Item> {
     });
 
     let mut items = Vec::new();
-    let mut seen_keys: HashSet<Arc<str>> = HashSet::new();
+    let mut seen_keys: HashSet<String> = HashSet::new();
     for source in [startmenu, uwp, path_apps, app_paths] {
         for item in source {
-            if seen_keys.insert(item.name_lower.clone()) {
+            if seen_keys.insert(item.name.to_lowercase()) {
                 items.push(item);
             }
         }
@@ -168,7 +164,7 @@ fn scan_env_path() -> Vec<Item> {
             if is_blacklisted(&name_lower, &path_lower) {
                 continue;
             }
-            items.push(Item::new_application(stem, &path_str, &pinyin_abbr(stem)));
+            items.push(Item::new_application(stem, &path_str));
         }
     }
     items
@@ -177,31 +173,39 @@ fn scan_env_path() -> Vec<Item> {
 fn scan_app_paths() -> Vec<Item> {
     let mut items = Vec::new();
     for hkey in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
-        if let Some(names) =
-            enum_reg_keys(hkey, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths")
-        {
-            for name in names {
-                let subkey = format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{name}");
-                let subkey_w = to_wide(&subkey);
-                if let Ok(exe) = read_reg_string(hkey, PCWSTR(subkey_w.as_ptr()), w!("")) {
-                    if exe.is_empty() {
-                        continue;
+        let subkeys: &[&str] = if hkey == HKEY_LOCAL_MACHINE {
+            &[
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths",
+                r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths",
+            ]
+        } else {
+            &[r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"]
+        };
+        for subkey in subkeys {
+            if let Some(names) = enum_reg_keys(hkey, subkey) {
+                for name in names {
+                    let val_path = format!(r"{subkey}\{name}");
+                    let val_w = to_wide(&val_path);
+                    if let Ok(exe) = read_reg_string(hkey, PCWSTR(val_w.as_ptr()), w!("")) {
+                        if exe.is_empty() {
+                            continue;
+                        }
+                        let stem = Path::new(&name)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(&name)
+                            .to_lowercase();
+                        let path_lower = exe.to_lowercase();
+                        if is_blacklisted(&stem, &path_lower)
+                            || (Path::new(&exe)
+                                .extension()
+                                .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+                                && is_cui_image(Path::new(&exe)))
+                        {
+                            continue;
+                        }
+                        items.push(Item::new_application(&stem, &exe));
                     }
-                    let stem = Path::new(&name)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(&name)
-                        .to_lowercase();
-                    let path_lower = exe.to_lowercase();
-                    if is_blacklisted(&stem, &path_lower)
-                        || (Path::new(&exe)
-                            .extension()
-                            .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
-                            && is_cui_image(Path::new(&exe)))
-                    {
-                        continue;
-                    }
-                    items.push(Item::new_application(&stem, &exe, &pinyin_abbr(&stem)));
                 }
             }
         }
@@ -303,19 +307,6 @@ fn known_folder_path(id: &GUID) -> Option<PathBuf> {
     }
 }
 
-fn targets_console_window(entry: &Path, ext: &str) -> bool {
-    match ext {
-        "exe" => is_cui_image(entry),
-        "lnk" | "appref-ms" => matches!(
-            unsafe { lnk_target(entry) },
-            Some(target)
-            if target.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"))
-                && is_cui_image(&target)
-        ),
-        _ => false,
-    }
-}
-
 fn is_cui_image(path: &Path) -> bool {
     read_pe_subsystem(path) == Some(3)
 }
@@ -338,35 +329,6 @@ fn pe_subsystem(buf: &[u8]) -> Option<u16> {
     }
     let off = e_lfanew + 24 + 68;
     Some(u16::from_le_bytes(buf.get(off..off + 2)?.try_into().ok()?))
-}
-
-unsafe fn lnk_target(path: &Path) -> Option<PathBuf> {
-    unsafe {
-        let wide = to_wide(&path.to_string_lossy());
-
-        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
-        let persist: IPersistFile = link.cast().ok()?;
-        persist.Load(PCWSTR(wide.as_ptr()), STGM_READ).ok()?;
-
-        let mut raw = [0u16; 1024];
-        link.GetPath(&mut raw, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32)
-            .ok()?;
-
-        let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
-        let raw_str = String::from_utf16_lossy(&raw[..end]);
-        if raw_str.is_empty() {
-            return None;
-        }
-
-        let raw_w = to_wide(&raw_str);
-        let mut expanded = [0u16; 1024];
-        let n = ExpandEnvironmentStringsW(PCWSTR(raw_w.as_ptr()), Some(&mut expanded)) as usize;
-
-        let expanded = String::from_utf16_lossy(&expanded[..n.min(expanded.len())])
-            .trim_end_matches('\0')
-            .to_string();
-        (!expanded.is_empty()).then_some(PathBuf::from(expanded))
-    }
 }
 
 fn walk_directory(dir: &Path, out: &mut Vec<Item>, depth: usize) {
@@ -395,13 +357,11 @@ fn walk_directory(dir: &Path, out: &mut Vec<Item>, depth: usize) {
                 let path_str = path.to_string_lossy().to_string();
                 let path_lower = path_str.to_lowercase();
 
-                if is_blacklisted(&name_lower, &path_lower)
-                    || targets_console_window(&path, &ext_str)
-                {
+                if is_blacklisted(&name_lower, &path_lower) {
                     continue;
                 }
 
-                out.push(Item::new_application(stem, &path_str, &pinyin_abbr(stem)));
+                out.push(Item::new_application(stem, &path_str));
             }
         }
     }
@@ -455,11 +415,7 @@ fn scan_uwp_apps() -> Vec<Item> {
                             format!(r"shell:AppsFolder\{parsing_path}")
                         };
 
-                        items.push(Item::new_application(
-                            &display_name,
-                            &aumid_path,
-                            &pinyin_abbr(&display_name),
-                        ));
+                        items.push(Item::new_application(&display_name, &aumid_path));
                     }
                 }
             }

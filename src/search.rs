@@ -1,144 +1,167 @@
-use crate::domain::{Item, Match};
-use pinyin::ToPinyin;
+use crate::domain::{Item, KeyKind, Match};
 
-pub fn pinyin_abbr(text: &str) -> String {
-    let mut abbr = String::with_capacity(text.len());
-    for c in text.chars() {
-        if c.is_ascii_alphanumeric() {
-            abbr.push(c.to_ascii_lowercase());
-        } else if let Some(p) = c.to_pinyin()
-            && let Some(first_char) = p.plain().chars().next()
+impl KeyKind {
+    #[inline]
+    pub fn score(&self, text: &str, q: &str) -> Option<i32> {
+        if text.is_empty() || q.is_empty() {
+            return None;
+        }
+
+        if text == q {
+            return Some(match self {
+                KeyKind::Name => 2500,
+                KeyKind::Pinyin => 2000,
+                KeyKind::Initials => 1800,
+                KeyKind::Alias => 1600,
+            });
+        }
+        if text.starts_with(q) {
+            let base = match self {
+                KeyKind::Name => 1500,
+                KeyKind::Pinyin => 1300,
+                KeyKind::Initials => 1200,
+                KeyKind::Alias => 1000,
+            };
+            let completeness_bonus = ((q.len() as f32 / text.len() as f32) * 80.0) as i32;
+            return Some(base + completeness_bonus);
+        }
+        if *self == KeyKind::Name && text.is_ascii() && abbr_matches(text.as_bytes(), q.as_bytes())
         {
-            abbr.push(first_char);
+            return Some(1100);
         }
+        if let Some(pos) = text.find(q) {
+            let base = match self {
+                KeyKind::Name => 700,
+                KeyKind::Pinyin => 600,
+                KeyKind::Initials => 500,
+                KeyKind::Alias => 400,
+            };
+            let boundary_bonus = if pos > 0 && is_word_sep(text.as_bytes()[pos - 1]) {
+                250
+            } else {
+                0
+            };
+            return Some(base + boundary_bonus - (pos as i32 * 10));
+        }
+        None
     }
-    // Prepend word-initial acronyms for all-ASCII names so multi-word English
-    // matches (e.g. "Visual Studio Code" -> "vsc...") hit the pinyin-prefix tier.
-    // For mixed Chinese+English names we append instead to keep pinyin at the front.
-    let words: Vec<&str> = text.split_whitespace().collect();
-    if words.len() > 1 {
-        let mut acronym = String::new();
-        for word in &words {
-            if let Some(first) = word.chars().next()
-                && first.is_ascii_alphanumeric()
-            {
-                acronym.push(first.to_ascii_lowercase());
-            }
-        }
-        if text.is_ascii() {
-            abbr = format!("{acronym}{abbr}");
-        } else if !acronym.is_empty() {
-            abbr = format!("{abbr}{acronym}");
-        }
-    }
-    abbr
 }
 
-/// Match an item, with Frecency weighting
+#[inline]
+fn is_word_sep(b: u8) -> bool {
+    b.is_ascii_whitespace() || matches!(b, b'-' | b'_' | b'.' | b'+')
+}
+
+fn abbr_matches(name_lower: &[u8], q: &[u8]) -> bool {
+    match name_lower.iter().position(|b| !is_word_sep(*b)) {
+        None => q.is_empty(),
+        Some(start) => {
+            let s = &name_lower[start..];
+            let w_len = s.iter().position(|b| is_word_sep(*b)).unwrap_or(s.len());
+            let (w, rest) = s.split_at(w_len);
+            (1..=w.len().min(q.len()))
+                .any(|take| w[..take] == q[..take] && abbr_matches(rest, &q[take..]))
+        }
+    }
+}
+
 pub fn match_item<'a>(
     item: &'a Item,
-    query: &str,
+    _query: &str,
     query_lower: &str,
     frecency_score: i32,
 ) -> Option<Match<'a>> {
-    if query.is_empty() {
+    if query_lower.is_empty() {
         return None;
     }
 
-    let mut base_score = None;
+    let base_score = item
+        .keys
+        .iter()
+        .filter_map(|(kind, key)| kind.score(key, query_lower))
+        .max()?;
 
-    // Exact
-    if &*item.name_lower == query_lower {
-        base_score = Some(2000);
-    // Prefix
-    } else if item.name_lower.starts_with(query_lower) {
-        base_score = Some(1200);
-    // Contains
-    } else if let Some(pos) = item.name_lower.find(query_lower) {
-        base_score = Some(600 - (pos as i32 * 10));
-    // Pinyin prefix
-    } else if !item.pinyin_abbr.is_empty() && item.pinyin_abbr.starts_with(query_lower) {
-        base_score = Some(900);
-    // Keyword prefix
-    } else if !item.keywords_lower.is_empty() && item.keywords_lower.starts_with(query_lower) {
-        base_score = Some(800);
-    // Pinyin contains
-    } else if !item.pinyin_abbr.is_empty()
-        && let Some(pos) = item.pinyin_abbr.find(query_lower)
-    {
-        base_score = Some(450 - (pos as i32 * 10));
-    // Keyword contains
-    } else if !item.keywords_lower.is_empty()
-        && let Some(pos) = item.keywords_lower.find(query_lower)
-    {
-        base_score = Some(400 - (pos as i32 * 10));
-    }
-
-    base_score.map(|s| {
-        // Total = base + frecency - penalty
-        let total_score = s + frecency_score - item.priority_penalty;
-        Match {
-            item,
-            score: total_score,
-        }
+    Some(Match {
+        item,
+        score: base_score + frecency_score - item.priority_penalty,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Action;
-    use std::sync::Arc;
 
     #[test]
-    fn test_pinyin_match() {
-        assert_eq!(pinyin_abbr("VSCode"), "vscode");
-        assert!(pinyin_abbr("Visual Studio Code").starts_with("vsc"));
+    fn test_unified_search_model() {
+        let vscode = Item::new_application("Visual Studio Code", r"C:\code.exe");
+        let wx = Item::new_application("\u{5fae}\u{4fe1}", r"C:\wx.exe");
+        let taskmgr = Item::new_application(
+            "\u{4efb}\u{52a1}\u{7ba1}\u{7406}\u{5668}",
+            r"C:\System32\Taskmgr.exe",
+        );
 
-        let item = Item {
-            name: Arc::from("Visual Studio Code"),
-            name_lower: Arc::from("visual studio code"),
-            keywords_lower: Arc::from(""),
-            pinyin_abbr: Arc::from("vsc"),
-            path: Arc::from("C:\\vscode.exe"),
-            kind: crate::domain::ItemKind::Application,
-            priority_penalty: 0,
-            action: Action::Launch(Arc::from("C:\\vscode.exe")),
-        };
+        assert_eq!(match_item(&vscode, "vsc", "vsc", 0).unwrap().score, 1100);
+        assert_eq!(
+            match_item(&vscode, "vscode", "vscode", 0).unwrap().score,
+            1100
+        );
+        assert_eq!(match_item(&vscode, "code", "code", 0).unwrap().score, 1600);
 
-        let m = match_item(&item, "vsc", "vsc", 200);
-        assert!(m.is_some());
-        assert_eq!(m.unwrap().score, 1100);
+        assert_eq!(match_item(&wx, "weixin", "weixin", 0).unwrap().score, 2000);
+        assert_eq!(match_item(&wx, "weix", "weix", 0).unwrap().score, 1353);
+        assert_eq!(match_item(&wx, "wx", "wx", 0).unwrap().score, 1800);
+        assert_eq!(match_item(&wx, "xin", "xin", 0).unwrap().score, 570);
+
+        assert_eq!(
+            match_item(&taskmgr, "taskmgr", "taskmgr", 0).unwrap().score,
+            1600
+        );
+        assert_eq!(
+            match_item(&taskmgr, "rwglq", "rwglq", 0).unwrap().score,
+            1800
+        );
+
+        let nj = Item::new_application("Node.js", r"C:\node.exe");
+        assert_eq!(match_item(&nj, "nj", "nj", 0).unwrap().score, 1100);
+
+        assert_eq!(match_item(&wx, "wx", "wx", 50).unwrap().score, 1850);
+
+        assert!(match_item(&wx, "qq", "qq", 0).is_none());
     }
 
     #[test]
-    fn test_exact_name_and_keyword_tiers() {
-        let item = Item {
-            name: Arc::from("Task Manager"),
-            name_lower: Arc::from("task manager"),
-            keywords_lower: Arc::from("mgr taskmgr"),
-            pinyin_abbr: Arc::from("tm"),
-            path: Arc::from(r"C:\Windows\System32\taskmgr.exe"),
-            kind: crate::domain::ItemKind::Application,
-            priority_penalty: 0,
-            action: Action::Launch(Arc::from(r"C:\Windows\System32\taskmgr.exe")),
-        };
+    fn test_builtin_item_keys() {
+        let cfg = Item::new_config();
+        let exit = Item::new_exit();
 
-        // Exact name scores 2000
+        assert_eq!(match_item(&cfg, "conf", "conf", 0).unwrap().score, 1553);
         assert_eq!(
-            match_item(&item, "Task Manager", "task manager", 0)
-                .unwrap()
-                .score,
-            2000
+            match_item(&cfg, "settings", "settings", 0).unwrap().score,
+            1600
         );
-        // Keyword prefix
-        assert_eq!(match_item(&item, "mgr", "mgr", 0).unwrap().score, 800);
-        // Keyword contains
-        assert_eq!(
-            match_item(&item, "taskmgr", "taskmgr", 0).unwrap().score,
-            360
-        );
-        // No match
-        assert!(match_item(&item, "xyz", "xyz", 0).is_none());
+        assert!(cfg.is_name_exact("config"));
+        assert!(!cfg.is_name_exact("settings"));
+
+        assert_eq!(match_item(&exit, ":q", ":q", 0).unwrap().score, 1600);
+        assert_eq!(match_item(&exit, "mist", "mist", 0).unwrap().score, 1600);
+
+        let calc = Item::new_calculator("7");
+        assert!(match_item(&calc, "7", "7", 0).is_none());
+
+        let uwp = Item::new_application("Photos", r"shell:AppsFolder\abc.def");
+        assert_eq!(uwp.keys.len(), 1);
+    }
+
+    #[test]
+    fn test_ranking_and_saturation() {
+        let vsc = Item::new_application("Visual Studio Code", r"C:\code.exe");
+        let chrome = Item::new_application("Google Chrome", r"C:\chrome.exe");
+        let wx = Item::new_application("\u{5fae}\u{4fe1}", r"C:\wx.exe");
+
+        assert!(match_item(&vsc, "vsc", "vsc", 0).unwrap().score >= 1100);
+        let code = match_item(&vsc, "code", "code", 0).unwrap().score;
+        assert!(code >= 800);
+        assert_eq!(match_item(&wx, "wx", "wx", 0).unwrap().score, 1800);
+        assert!(match_item(&chrome, "c", "c", 400).unwrap().score < 1800);
     }
 }

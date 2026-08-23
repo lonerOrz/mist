@@ -11,19 +11,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::*;
 
-/// UTF-16 with NUL terminator for Win32 APIs.
 pub(crate) fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// NUL-free variant for DirectWrite text slices.
 pub(crate) fn to_wide_slice(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    Launch(Arc<str>),
+    Launch {
+        path: Arc<str>,
+        verb: Option<&'static str>,
+    },
     CopyText(Arc<str>),
     ExitApp,
 }
@@ -42,27 +43,23 @@ impl Action {
             Action::ExitApp => unsafe {
                 PostQuitMessage(0);
             },
-            Action::Launch(path) => {
+            Action::Launch { path, verb } => {
                 let path_str = &**path;
 
-                // Allow the newly launched process to steal foreground focus
                 unsafe {
                     let _ = AllowSetForegroundWindow(0xFFFFFFFF);
                 }
 
-                // cmd.exe /k or /c command
                 let (file, params, working_dir) =
                     if let Some(cmd) = path_str.strip_prefix("cmd.exe /k ") {
                         ("cmd.exe", format!("/k {cmd}"), String::new())
                     } else if let Some(cmd) = path_str.strip_prefix("cmd.exe /c ") {
                         ("cmd.exe", format!("/c {cmd}"), String::new())
-                    // shell: / .lnk / .url — resolved natively
                     } else if path_str.starts_with("shell:AppsFolder\\")
                         || path_str.to_lowercase().ends_with(".lnk")
                         || path_str.to_lowercase().ends_with(".url")
                     {
                         (path_str, String::new(), String::new())
-                    // standalone file (parent dir as CWD; UNC/empty → process CWD)
                     } else {
                         let target_path = Path::new(path_str);
                         let dir = target_path
@@ -81,8 +78,11 @@ impl Action {
                 };
                 let dir_w = to_wide(&working_dir);
 
-                // NULL verb = default; "runas" only when elevating
-                let verb = if as_admin {
+                let verb_holder;
+                let verb = if let Some(v) = verb {
+                    verb_holder = to_wide(v);
+                    PCWSTR(verb_holder.as_ptr())
+                } else if as_admin {
                     w!("runas")
                 } else {
                     PCWSTR::null()
@@ -121,7 +121,6 @@ impl Action {
     }
 }
 
-/// Opens the clipboard and closes it on drop, so a failed path can't leak it open.
 pub struct ClipboardGuard;
 
 impl ClipboardGuard {
@@ -152,7 +151,6 @@ fn set_clipboard(text: &str) {
             if !ptr.is_null() {
                 std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, ptr as *mut u8, size);
                 let _ = GlobalUnlock(hmem);
-                // free only if the clipboard didn't take ownership
                 let delivered = matches!(
                     SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hmem.0))),
                     Ok(h) if !h.0.is_null()
@@ -167,7 +165,6 @@ fn set_clipboard(text: &str) {
     }
 }
 
-/// Read clipboard text; always closes the clipboard on exit.
 pub(crate) fn get_clipboard_text() -> Option<String> {
     let _guard = ClipboardGuard::open()?;
     unsafe {
@@ -180,8 +177,9 @@ pub(crate) fn get_clipboard_text() -> Option<String> {
         if ptr.is_null() {
             return None;
         }
+        let max_len = GlobalSize(hmem) / std::mem::size_of::<u16>();
         let mut len = 0usize;
-        while *ptr.add(len) != 0 {
+        while len < max_len && *ptr.add(len) != 0 {
             len += 1;
         }
         let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
@@ -197,45 +195,85 @@ pub enum ItemKind {
     Command { raw: Arc<str> },
     Config,
     Exit,
+    Web,
+    Path,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    Name,
+    Pinyin,
+    Initials,
+    Alias,
 }
 
 #[derive(Debug, Clone)]
 pub struct Item {
     pub name: Arc<str>,
-    pub name_lower: Arc<str>,
-    /// Extra search keywords (aliases), separate from name_lower.
-    pub keywords_lower: Arc<str>,
-    pub pinyin_abbr: Arc<str>,
     pub path: Arc<str>,
     pub kind: ItemKind,
     pub priority_penalty: i32,
     pub action: Action,
+    pub keys: Box<[(KeyKind, Arc<str>)]>,
 }
 
 impl Item {
-    /// Indexed entry: derived fields set consistently.
-    pub fn new_application(name: &str, path: &str, pinyin_abbr: &str) -> Self {
+    pub fn new_application(name: &str, path: &str) -> Self {
+        let name_lower = name.to_lowercase();
+        let mut keys: Vec<(KeyKind, Arc<str>)> =
+            vec![(KeyKind::Name, Arc::from(name_lower.as_str()))];
+
+        let mut initials = String::with_capacity(name.len());
+        let mut full = String::with_capacity(name.len() * 4);
+        let mut has_cjk = false;
+        for c in name.chars() {
+            if c.is_ascii_alphanumeric() {
+                let lower = c.to_ascii_lowercase();
+                initials.push(lower);
+                full.push(lower);
+            } else if let Some(py) = crate::pinyin::get_char_pinyin(c) {
+                has_cjk = true;
+                initials.push(py.as_bytes()[0] as char);
+                full.push_str(py);
+            }
+        }
+        if has_cjk {
+            keys.push((KeyKind::Pinyin, Arc::from(full)));
+            keys.push((KeyKind::Initials, Arc::from(initials)));
+        }
+
+        if !path.starts_with("shell:")
+            && let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str())
+        {
+            let stem_lower = stem.to_lowercase();
+            if stem_lower != name_lower
+                && !keys
+                    .iter()
+                    .any(|(_, key)| key.as_ref() == stem_lower.as_str())
+            {
+                keys.push((KeyKind::Alias, Arc::from(stem_lower)));
+            }
+        }
+
         let path_arc: Arc<str> = Arc::from(path);
         Self {
             name: Arc::from(name),
-            name_lower: Arc::from(name.to_lowercase()),
-            keywords_lower: Arc::from(""),
-            pinyin_abbr: Arc::from(pinyin_abbr),
             path: path_arc.clone(),
             kind: ItemKind::Application,
             priority_penalty: 0,
-            action: Action::Launch(path_arc),
+            action: Action::Launch {
+                path: path_arc,
+                verb: None,
+            },
+            keys: keys.into_boxed_slice(),
         }
     }
 
-    /// Calculator result is display-only, excluded from search.
     pub fn new_calculator(result: &str) -> Self {
         let res_arc: Arc<str> = Arc::from(result);
         Self {
             name: Arc::from(format!("= {result}")),
-            name_lower: Arc::from(""),
-            keywords_lower: Arc::from(""),
-            pinyin_abbr: Arc::from(""),
+            keys: Box::new([]),
             path: Arc::from("Result (press Enter to copy)"),
             kind: ItemKind::Calculator {
                 result: res_arc.clone(),
@@ -245,7 +283,6 @@ impl Item {
         }
     }
 
-    /// Command fallback: native if path exists, else via cmd (/c, "|| pause" on failure).
     pub fn new_command(raw_cmd: &str) -> Self {
         let action_str: Arc<str> = if Path::new(raw_cmd).exists() {
             Arc::from(raw_cmd)
@@ -254,15 +291,16 @@ impl Item {
         };
         Self {
             name: Arc::from(format!("Run command: {raw_cmd}")),
-            name_lower: Arc::from(""),
-            keywords_lower: Arc::from(""),
-            pinyin_abbr: Arc::from(""),
+            keys: Box::new([]),
             path: Arc::from(format!("Execute in command prompt: {raw_cmd}")),
             kind: ItemKind::Command {
                 raw: Arc::from(raw_cmd),
             },
             priority_penalty: 0,
-            action: Action::Launch(action_str),
+            action: Action::Launch {
+                path: action_str,
+                verb: None,
+            },
         }
     }
 
@@ -272,27 +310,47 @@ impl Item {
         let path_arc: Arc<str> = Arc::from(path_str.as_str());
         Self {
             name: Arc::from("Open Config (config.toml)"),
-            name_lower: Arc::from("config configuration settings preference"),
-            keywords_lower: Arc::from("options"),
-            pinyin_abbr: Arc::from(""),
+            keys: vec![
+                (KeyKind::Name, Arc::from("config")),
+                (KeyKind::Alias, Arc::from("configuration")),
+                (KeyKind::Alias, Arc::from("settings")),
+                (KeyKind::Alias, Arc::from("preference")),
+                (KeyKind::Alias, Arc::from("options")),
+            ]
+            .into_boxed_slice(),
             path: path_arc.clone(),
             kind: ItemKind::Config,
             priority_penalty: 0,
-            action: Action::Launch(path_arc),
+            action: Action::Launch {
+                path: path_arc,
+                verb: None,
+            },
         }
     }
 
     pub fn new_exit() -> Self {
         Self {
             name: Arc::from("Exit Mist"),
-            name_lower: Arc::from("exit mist quit"),
-            keywords_lower: Arc::from(":q close"),
-            pinyin_abbr: Arc::from(""),
+            keys: vec![
+                (KeyKind::Name, Arc::from("exit")),
+                (KeyKind::Alias, Arc::from("mist")),
+                (KeyKind::Alias, Arc::from("quit")),
+                (KeyKind::Alias, Arc::from("close")),
+                (KeyKind::Alias, Arc::from(":q")),
+            ]
+            .into_boxed_slice(),
             path: Arc::from("Quit the launcher process"),
             kind: ItemKind::Exit,
             priority_penalty: 0,
             action: Action::ExitApp,
         }
+    }
+
+    #[inline]
+    pub fn is_name_exact(&self, q_lower: &str) -> bool {
+        self.keys
+            .iter()
+            .any(|(kind, key)| *kind == KeyKind::Name && key.as_ref() == q_lower)
     }
 }
 

@@ -13,14 +13,12 @@ pub struct Record {
 
 pub struct History {
     records: HashMap<String, Record>,
-    sender: Option<Sender<String>>, // One I/O thread serializes all writes
+    sender: Option<Sender<String>>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl Drop for History {
     fn drop(&mut self) {
-        // Closing the sender ends the thread's recv loop, then we wait for the
-        // final write to flush before the process exits.
         drop(self.sender.take());
         if let Some(h) = self.worker.take() {
             let _ = h.join();
@@ -35,7 +33,6 @@ impl History {
         let mut records = HashMap::new();
         if let Ok(content) = fs::read_to_string(&file_path) {
             for line in content.lines() {
-                // Reverse split: keys may contain '='
                 let parts: Vec<&str> = line.rsplitn(3, '=').collect();
                 if parts.len() == 3 {
                     let last_used = parts[0].trim().parse::<u64>().unwrap_or(0);
@@ -47,8 +44,25 @@ impl History {
         }
 
         let (tx, rx) = channel::<String>();
+        let worker_records = records.clone();
         let worker = std::thread::spawn(move || {
-            while let Ok(content) = rx.recv() {
+            let mut records = worker_records;
+            while let Ok(key) = rx.recv() {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let entry = records.entry(key).or_insert(Record {
+                    count: 0,
+                    last_used: now,
+                });
+                entry.count = entry.count.saturating_add(1);
+                entry.last_used = now;
+
+                let mut content = String::with_capacity(records.len() * 32);
+                for (k, rec) in &records {
+                    content.push_str(&format!("{}={}={}\n", k, rec.count, rec.last_used));
+                }
                 let _ = fs::write(&file_path, content);
             }
         });
@@ -74,12 +88,8 @@ impl History {
         entry.count = entry.count.saturating_add(1);
         entry.last_used = now;
 
-        let mut content = String::with_capacity(1024);
-        for (k, rec) in &self.records {
-            content.push_str(&format!("{}={}={}\n", k, rec.count, rec.last_used));
-        }
         if let Some(sender) = &self.sender {
-            let _ = sender.send(content);
+            let _ = sender.send(key.to_string());
         }
     }
 
@@ -101,7 +111,7 @@ impl History {
                 20
             };
 
-            (rec.count as i32) * multiplier
+            ((rec.count as i32) * multiplier).min(400)
         } else {
             0
         }

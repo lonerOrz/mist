@@ -1,18 +1,19 @@
 #![windows_subsystem = "windows"]
 
 pub mod app;
-pub mod calc;
 pub mod config;
 pub mod domain;
 pub mod history;
-pub mod indexer;
+pub mod pinyin;
+pub mod query;
 pub mod renderer;
 pub mod search;
+pub mod sources;
 
 use app::{App, TIMER_ANIMATION};
 use config::Config;
 use domain::Item;
-use renderer::{Renderer, metrics};
+use renderer::{Renderer, metrics, window_scale};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -78,13 +79,31 @@ fn apply_hotkeys(hwnd: HWND, hotkey_str: &str) {
     }
 }
 
+fn apply_corner(hwnd: HWND, radius: f32) {
+    let pref = if radius >= 6.0 {
+        DWMWCP_ROUND
+    } else if radius > 0.0 {
+        DWMWCP_ROUNDSMALL
+    } else {
+        DWMWCP_DONOTROUND
+    };
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &pref as *const _ as *const _,
+            4,
+        )
+    };
+}
+
 fn main() -> Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-        let _guard = CreateMutexW(None, false, w!("SeliLauncherMutex"))?;
+        let _guard = CreateMutexW(None, false, w!("MistLauncherMutex"))?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            if let Ok(existing) = FindWindowW(w!("SeliLauncherClass"), None) {
+            if let Ok(existing) = FindWindowW(w!("MistLauncherClass"), None) {
                 let _ = PostMessageW(
                     Some(existing),
                     WM_HOTKEY,
@@ -111,7 +130,7 @@ fn main() -> Result<()> {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
 
         let instance = GetModuleHandleW(None)?;
-        let class_name = w!("SeliLauncherClass");
+        let class_name = w!("MistLauncherClass");
 
         let default_cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
 
@@ -129,15 +148,16 @@ fn main() -> Result<()> {
 
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
-        let width = metrics::WINDOW_WIDTH;
-        let height = metrics::HEADER_HEIGHT;
+        let scale = GetDpiForSystem() as f32 / 96.0;
+        let width = (config.width as f32 * scale).round() as i32;
+        let height = (metrics::HEADER_HEIGHT as f32 * scale).round() as i32;
         let x = (screen_w - width) / 2;
         let y = (screen_h - height) / 3;
 
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             class_name,
-            w!("Seli Launcher"),
+            w!("Mist"),
             WS_POPUP,
             x,
             y,
@@ -157,13 +177,7 @@ fn main() -> Result<()> {
             std::mem::size_of::<BOOL>() as u32,
         );
 
-        let corner_pref = DWMWCP_ROUND;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            &corner_pref as *const _ as *const _,
-            4,
-        );
+        apply_corner(hwnd, config.corner_radius);
 
         const DWMSBT_TRANSIENTWINDOW: i32 = 3;
         let backdrop_type = DWMSBT_TRANSIENTWINDOW;
@@ -194,17 +208,25 @@ fn main() -> Result<()> {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
     }
 
-    // Start config hot reload watcher
     Config::watch_and_notify(hwnd, WM_CONFIG_RELOADED);
 
     let hwnd_raw = hwnd.0 as isize;
     std::thread::spawn(move || {
-        let items = indexer::scan_all();
+        let items = sources::apps::scan_all();
         let boxed_items = Box::new(items);
         let target_hwnd = HWND(hwnd_raw as *mut _);
-        let ptr = LPARAM(Box::into_raw(boxed_items) as isize);
+        let raw = Box::into_raw(boxed_items);
         unsafe {
-            let _ = PostMessageW(Some(target_hwnd), WM_INDEX_READY, WPARAM(0), ptr);
+            if PostMessageW(
+                Some(target_hwnd),
+                WM_INDEX_READY,
+                WPARAM(0),
+                LPARAM(raw as isize),
+            )
+            .is_err()
+            {
+                drop(Box::from_raw(raw));
+            }
         }
     });
 
@@ -243,10 +265,10 @@ unsafe extern "system" fn wnd_proc(
                 let _ = unsafe { GetCursorPos(&mut pt) };
                 let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
 
-                // I-beam over the input area, standard arrow elsewhere.
+                let s = window_scale(hwnd);
                 let cursor_id = if pt.y >= 0
-                    && pt.y < metrics::HEADER_HEIGHT
-                    && pt.x as f32 >= metrics::INPUT_X
+                    && (pt.y as f32) < metrics::HEADER_HEIGHT as f32 * s
+                    && pt.x as f32 >= metrics::INPUT_X * s
                 {
                     IDC_IBEAM
                 } else {
@@ -272,7 +294,9 @@ unsafe extern "system" fn wnd_proc(
 
         WM_CREATE => {
             unsafe {
-                let _ = SetTimer(Some(hwnd), TIMER_CARET, 1500, None);
+                let blink = GetCaretBlinkTime();
+                let blink = if blink == 0 { 500 } else { blink };
+                let _ = SetTimer(Some(hwnd), TIMER_CARET, blink, None);
             }
             LRESULT(0)
         }
@@ -284,7 +308,6 @@ unsafe extern "system" fn wnd_proc(
                     app.set_index(*boxed);
                     app.on_query_change(hwnd);
                 }
-                // Indexing is done; hand scan-time heap pages back to the OS.
                 unsafe {
                     let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
                 }
@@ -295,10 +318,31 @@ unsafe extern "system" fn wnd_proc(
         WM_CONFIG_RELOADED => {
             if lparam.0 != 0 {
                 let boxed = unsafe { Box::from_raw(lparam.0 as *mut Config) };
+                apply_corner(hwnd, boxed.corner_radius);
                 apply_hotkeys(hwnd, &boxed.hotkey);
                 if let Some(app) = app_opt {
                     app.update_config(hwnd, *boxed);
                 }
+            }
+            LRESULT(0)
+        }
+
+        WM_DPICHANGED => {
+            if let Some(app) = app_opt {
+                let suggested = unsafe { *(lparam.0 as *const RECT) };
+                unsafe {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        None,
+                        suggested.left,
+                        suggested.top,
+                        suggested.right - suggested.left,
+                        suggested.bottom - suggested.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+                app.renderer.invalidate();
+                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
             }
             LRESULT(0)
         }
@@ -346,7 +390,10 @@ unsafe extern "system" fn wnd_proc(
                     VK_BACK => {
                         if is_ctrl {
                             let trimmed = app.query.trim_end();
-                            let cut = trimmed.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+                            let cut = trimmed
+                                .char_indices()
+                                .rfind(|(_, c)| c.is_whitespace())
+                                .map_or(0, |(i, c)| i + c.len_utf8());
                             app.query.truncate(cut);
                         } else {
                             app.query.pop();
@@ -398,11 +445,12 @@ unsafe extern "system" fn wnd_proc(
                     && let Some(app) = app_opt
                 {
                     app.caret_visible = !app.caret_visible;
+                    let s = window_scale(hwnd);
                     let rect = RECT {
-                        left: metrics::INPUT_X as i32,
+                        left: (metrics::INPUT_X * s) as i32,
                         top: 0,
-                        right: metrics::WINDOW_WIDTH - 20,
-                        bottom: metrics::HEADER_HEIGHT,
+                        right: ((app.config.width - 20) as f32 * s) as i32,
+                        bottom: (metrics::HEADER_HEIGHT as f32 * s) as i32,
                     };
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), Some(&rect), false);
@@ -426,7 +474,7 @@ unsafe extern "system" fn wnd_proc(
 
         WM_MOUSEMOVE => {
             if let Some(app) = app_opt {
-                let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32;
+                let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32 / window_scale(hwnd);
                 app.on_mouse_move(hwnd, y);
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -453,8 +501,9 @@ unsafe extern "system" fn wnd_proc(
 
         WM_LBUTTONDOWN => {
             if let Some(app) = app_opt {
-                let x = (lparam.0 & 0xffff) as i16 as f32;
-                let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32;
+                let s = window_scale(hwnd);
+                let x = (lparam.0 & 0xffff) as i16 as f32 / s;
+                let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32 / s;
                 app.on_click(hwnd, x, y);
             }
             LRESULT(0)
@@ -472,6 +521,29 @@ unsafe extern "system" fn wnd_proc(
 
         WM_DESTROY => {
             unsafe {
+                let mut pending = MSG::default();
+                while PeekMessageW(
+                    &mut pending,
+                    Some(hwnd),
+                    WM_INDEX_READY,
+                    WM_CONFIG_RELOADED,
+                    PM_REMOVE,
+                )
+                .into()
+                {
+                    if pending.lParam.0 != 0 {
+                        match pending.message {
+                            WM_INDEX_READY => {
+                                drop(Box::from_raw(pending.lParam.0 as *mut Vec<Item>));
+                            }
+                            WM_CONFIG_RELOADED => {
+                                drop(Box::from_raw(pending.lParam.0 as *mut Config));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
                 let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
                 let _ = UnregisterHotKey(Some(hwnd), HOTKEY_FALLBACK_ID);
                 let _ = KillTimer(Some(hwnd), TIMER_CARET);
@@ -507,16 +579,18 @@ unsafe fn toggle_window(hwnd: HWND) {
                 app.results.clear();
                 app.selected = 0;
                 app.hovered = None;
+                app.caret_visible = true;
                 app.height_spring.reset(metrics::HEADER_HEIGHT as f32);
                 app.pill.reset(metrics::LIST_TOP);
 
+                let s = window_scale(hwnd);
                 let _ = SetWindowPos(
                     hwnd,
                     Some(HWND_TOPMOST),
                     0,
                     0,
-                    metrics::WINDOW_WIDTH,
-                    metrics::HEADER_HEIGHT,
+                    (app.config.width as f32 * s).round() as i32,
+                    (metrics::HEADER_HEIGHT as f32 * s).round() as i32,
                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
                 );
 

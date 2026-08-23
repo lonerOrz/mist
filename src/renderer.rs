@@ -9,35 +9,60 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
 use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ, HPALETTE};
 use windows::Win32::Graphics::Imaging::*;
 use windows::Win32::System::Com::*;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::*;
 use windows_numerics::Vector2;
 
 pub mod metrics {
-    pub const WINDOW_WIDTH: i32 = 760;
     pub const HEADER_HEIGHT: i32 = 56;
     pub const ITEM_HEIGHT: i32 = 54;
     pub const LIST_TOP: f32 = 64.0;
-    /// Left edge of the query input area (shared by drawing, hit-testing, cursor).
     pub const INPUT_X: f32 = 48.0;
-    /// Admin-badge hit zone, measured inward from the window's right edge.
     pub const ADMIN_ZONE_FAR: i32 = 176;
     pub const ADMIN_ZONE_NEAR: i32 = 82;
 }
 
-// Nerd Font glyphs (FontAwesome legacy range, stable in NF v3).
-const BADGE_FX: PCWSTR = w!("\u{f1ec}"); // nf-fa-calculator
-const BADGE_CMD: PCWSTR = w!("\u{f120}"); // nf-fa-terminal
-const BADGE_CFG: PCWSTR = w!("\u{f013}"); // nf-fa-gear
-const BADGE_APP: PCWSTR = w!("\u{f009}"); // nf-fa-th_large
-const BADGE_EXIT: PCWSTR = w!("\u{f011}"); // nf-fa-power_off
+#[derive(Debug, Clone, Copy)]
+pub struct Theme {
+    pub width: i32,
+    pub opacity: f32,
+    pub pill_radius: f32,
+    pub badge_radius: f32,
+    pub button_radius: f32,
+}
+
+impl Theme {
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        let r = config.corner_radius;
+        Self {
+            width: config.width,
+            opacity: config.opacity,
+            pill_radius: r,
+            badge_radius: (r * 0.85).max(0.0),
+            button_radius: (r * 0.60).max(0.0),
+        }
+    }
+}
+
+const BADGE_FX: PCWSTR = w!("\u{f1ec}");
+const BADGE_CMD: PCWSTR = w!("\u{f120}");
+const BADGE_CFG: PCWSTR = w!("\u{f013}");
+const BADGE_APP: PCWSTR = w!("\u{f009}");
+const BADGE_EXIT: PCWSTR = w!("\u{f011}");
+const BADGE_WEB: PCWSTR = w!("\u{f0ac}");
+const BADGE_PATH: PCWSTR = w!("\u{f07b}");
 const KEY_CAP_COPY: PCWSTR = w!("↵ Copy");
 const KEY_CAP_RUN: PCWSTR = w!("↵ Run");
 const KEY_CAP_OPEN: PCWSTR = w!("↵ Open");
 const KEY_CAP_EDIT: PCWSTR = w!("↵ Edit");
 const KEY_CAP_EXIT: PCWSTR = w!("↵ Exit");
 const KEY_CAP_ADMIN: PCWSTR = w!("Shift+↵ Admin");
+
+pub fn window_scale(hwnd: HWND) -> f32 {
+    (unsafe { GetDpiForWindow(hwnd) as f32 }) / 96.0
+}
 
 pub struct IconCache {
     wic_factory: IWICImagingFactory,
@@ -61,17 +86,27 @@ impl IconCache {
         &mut self,
         rt: &ID2D1RenderTarget,
         path: &Arc<str>,
+        px: u32,
     ) -> Option<ID2D1Bitmap> {
-        if let Some(bm) = self.cache.get(path) {
+        let key: Arc<str> = Arc::from(format!("{path}\u{0}{px}").as_str());
+        if let Some(bm) = self.cache.get(&key) {
             return bm.clone();
         }
 
-        let loaded = unsafe { self.load_shell_icon(rt, path) };
-        self.cache.insert(path.clone(), loaded.clone());
+        let loaded = unsafe { self.load_shell_icon(rt, path, px) };
+        self.cache.insert(key, loaded.clone());
+        if self.cache.len() > 512 {
+            self.cache.clear();
+        }
         loaded
     }
 
-    unsafe fn load_shell_icon(&self, rt: &ID2D1RenderTarget, path: &str) -> Option<ID2D1Bitmap> {
+    unsafe fn load_shell_icon(
+        &self,
+        rt: &ID2D1RenderTarget,
+        path: &str,
+        px: u32,
+    ) -> Option<ID2D1Bitmap> {
         unsafe {
             let path_w = to_wide(path);
             let shell_item: IShellItem =
@@ -80,7 +115,10 @@ impl IconCache {
 
             let hbitmap = image_factory
                 .GetImage(
-                    SIZE { cx: 32, cy: 32 },
+                    SIZE {
+                        cx: px as i32,
+                        cy: px as i32,
+                    },
                     SIIGBF_BIGGERSIZEOK | SIIGBF_ICONONLY,
                 )
                 .ok()?;
@@ -111,11 +149,6 @@ impl IconCache {
     }
 }
 
-/// Draws a Nerd Font glyph centered on its visual ink bounds.
-///
-/// DirectWrite's built-in alignment centers on the font line box, which is
-/// asymmetric for NF glyphs; measuring the layout metrics avoids that drift.
-///
 /// # Safety
 ///
 /// All D2D/DWrite parameters must be valid objects on the UI thread.
@@ -152,8 +185,6 @@ unsafe fn draw_badge_icon(
     }
 }
 
-/// Standard rounded icon badge: fill + border + visually centered glyph.
-///
 /// # Safety
 ///
 /// All brush/format/target parameters must be valid D2D objects on the UI thread.
@@ -163,6 +194,7 @@ unsafe fn draw_badge(
     dwrite_factory: &IDWriteFactory,
     icon_fmt: &IDWriteTextFormat,
     rect: &D2D_RECT_F,
+    radius: f32,
     bg: &ID2D1SolidColorBrush,
     border: &ID2D1SolidColorBrush,
     glyph: &[u16],
@@ -170,8 +202,8 @@ unsafe fn draw_badge(
 ) {
     let badge = D2D1_ROUNDED_RECT {
         rect: *rect,
-        radiusX: 7.0,
-        radiusY: 7.0,
+        radiusX: radius,
+        radiusY: radius,
     };
     unsafe {
         target.FillRoundedRectangle(&badge, bg);
@@ -201,8 +233,6 @@ struct FormatSet {
     item_title: IDWriteTextFormat,
     item_sub: IDWriteTextFormat,
     badge: IDWriteTextFormat,
-    /// Dedicated format for Nerd Font badge icons, so PUA glyphs resolve
-    /// against the configured NF family without touching text typography.
     badge_icon: IDWriteTextFormat,
 }
 
@@ -279,6 +309,7 @@ pub struct Renderer {
     dwrite_factory: IDWriteFactory,
     pub icon_cache: IconCache,
     font_family: String,
+    theme: Theme,
     context: Option<D2DContext>,
 }
 
@@ -295,9 +326,14 @@ impl Renderer {
                 dwrite_factory,
                 icon_cache,
                 font_family,
+                theme: Theme::from_config(&crate::config::Config::default()),
                 context: None,
             })
         }
+    }
+
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
     }
 
     /// # Safety
@@ -310,14 +346,15 @@ impl Renderer {
         Ok(self.context.as_mut().unwrap())
     }
 
-    /// Drops the D2D/DWrite context so the next frame rebuilds it with the
-    /// new font family. Cached icon bitmaps are device-dependent resources
-    /// bound to the old render target, so they must go too.
+    pub fn invalidate(&mut self) {
+        self.context = None;
+        self.icon_cache.cache.clear();
+    }
+
     pub fn set_font_family(&mut self, font_family: String) {
         if self.font_family != font_family {
             self.font_family = font_family;
-            self.context = None;
-            self.icon_cache.cache.clear();
+            self.invalidate();
         }
     }
 
@@ -335,14 +372,15 @@ impl Renderer {
                 presentOptions: D2D1_PRESENT_OPTIONS_NONE,
             };
 
+            let dpi = GetDpiForWindow(hwnd) as f32;
             let rt_properties = D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 pixelFormat: D2D1_PIXEL_FORMAT {
                     format: DXGI_FORMAT_UNKNOWN,
                     alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
                 },
-                dpiX: 0.0,
-                dpiY: 0.0,
+                dpiX: dpi,
+                dpiY: dpi,
                 usage: D2D1_RENDER_TARGET_USAGE_NONE,
                 minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
             };
@@ -372,8 +410,6 @@ impl Renderer {
                 admin_badge: mk(1.0, 0.72, 0.20, 1.0)?,
             };
 
-            // Falls back to a system font when the configured family is
-            // missing, so a bad config.toml entry can never kill rendering.
             let mk_format = |family: &str,
                              weight: DWRITE_FONT_WEIGHT,
                              size: f32|
@@ -399,9 +435,6 @@ impl Renderer {
                 item_title: mk_format(&self.font_family, DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0)?,
                 item_sub: mk_format(&self.font_family, DWRITE_FONT_WEIGHT_NORMAL, 11.5)?,
                 badge: mk_format(&self.font_family, DWRITE_FONT_WEIGHT_SEMI_BOLD, 10.5)?,
-                // No built-in alignment here: draw_badge_icon centers glyphs
-                // manually from layout metrics, and format alignment would
-                // offset the result.
                 badge_icon: mk_format(&self.font_family, DWRITE_FONT_WEIGHT_NORMAL, 13.5)?,
             };
 
@@ -476,6 +509,8 @@ impl Renderer {
     ) -> Result<()> {
         unsafe {
             self.ensure_context(hwnd)?;
+            let icon_px = (32.0 * GetDpiForWindow(hwnd) as f32 / 96.0).round() as u32;
+            let theme = self.theme;
             let dwrite_factory = self.dwrite_factory.clone();
             let Renderer {
                 icon_cache,
@@ -502,7 +537,7 @@ impl Renderer {
                 r: 0.11,
                 g: 0.11,
                 b: 0.14,
-                a: 0.72,
+                a: theme.opacity,
             }));
 
             let win_rect = D2D_RECT_F {
@@ -529,9 +564,8 @@ impl Renderer {
                 None,
             );
 
-            // Input viewport: shift text left once the caret passes the visible edge.
             let input_clip_left = metrics::INPUT_X;
-            let input_clip_right = (metrics::WINDOW_WIDTH - 24) as f32;
+            let input_clip_right = theme.width as f32 - 24.0;
             let max_visible_width = input_clip_right - input_clip_left;
 
             let (text_to_draw, is_placeholder) = if query.is_empty() {
@@ -600,7 +634,6 @@ impl Renderer {
             );
             target.PopAxisAlignedClip();
 
-            // Caret.
             if caret_visible {
                 let final_caret_x = input_clip_left + caret_offset_x - scroll_x;
                 target.DrawLine(
@@ -634,8 +667,8 @@ impl Renderer {
                         right: size.width as f32 - 8.0,
                         bottom: pill_y + item_h - 4.0,
                     },
-                    radiusX: 8.0,
-                    radiusY: 8.0,
+                    radiusX: theme.pill_radius,
+                    radiusY: theme.pill_radius,
                 };
                 target.FillRoundedRectangle(&pill_rect, &ctx.brushes.selection);
                 target.DrawRoundedRectangle(&pill_rect, &ctx.brushes.selection_border, 1.0, None);
@@ -652,8 +685,8 @@ impl Renderer {
                         right: size.width as f32 - 8.0,
                         bottom,
                     },
-                    radiusX: 8.0,
-                    radiusY: 8.0,
+                    radiusX: theme.pill_radius,
+                    radiusY: theme.pill_radius,
                 };
 
                 if Some(i) == hovered && i != selected {
@@ -680,6 +713,7 @@ impl Renderer {
                         &dwrite_factory,
                         icon_fmt,
                         &icon_container,
+                        theme.badge_radius,
                         &ctx.brushes.accent_subtle,
                         &ctx.brushes.accent_border,
                         BADGE_CFG.as_wide(),
@@ -690,6 +724,7 @@ impl Renderer {
                         &dwrite_factory,
                         icon_fmt,
                         &icon_container,
+                        theme.badge_radius,
                         &ctx.brushes.badge_bg,
                         &ctx.brushes.border,
                         BADGE_EXIT.as_wide(),
@@ -700,6 +735,7 @@ impl Renderer {
                         &dwrite_factory,
                         icon_fmt,
                         &icon_container,
+                        theme.badge_radius,
                         &ctx.brushes.accent_subtle,
                         &ctx.brushes.accent_border,
                         BADGE_FX.as_wide(),
@@ -710,13 +746,36 @@ impl Renderer {
                         &dwrite_factory,
                         icon_fmt,
                         &icon_container,
+                        theme.badge_radius,
                         &ctx.brushes.badge_bg,
                         &ctx.brushes.border,
                         BADGE_CMD.as_wide(),
                         &ctx.brushes.admin_badge,
                     ),
+                    ItemKind::Web => draw_badge(
+                        &target,
+                        &dwrite_factory,
+                        icon_fmt,
+                        &icon_container,
+                        theme.badge_radius,
+                        &ctx.brushes.accent_subtle,
+                        &ctx.brushes.accent_border,
+                        BADGE_WEB.as_wide(),
+                        &ctx.brushes.accent,
+                    ),
+                    ItemKind::Path => draw_badge(
+                        &target,
+                        &dwrite_factory,
+                        icon_fmt,
+                        &icon_container,
+                        theme.badge_radius,
+                        &ctx.brushes.badge_bg,
+                        &ctx.brushes.border,
+                        BADGE_PATH.as_wide(),
+                        &ctx.brushes.subtext,
+                    ),
                     ItemKind::Application => {
-                        let icon_bmp = icon_cache.get_or_load(&target, &item.path);
+                        let icon_bmp = icon_cache.get_or_load(&target, &item.path, icon_px);
                         if let Some(bmp) = icon_bmp {
                             target.DrawBitmap(
                                 &bmp,
@@ -731,6 +790,7 @@ impl Renderer {
                                 &dwrite_factory,
                                 icon_fmt,
                                 &icon_container,
+                                theme.badge_radius,
                                 &ctx.brushes.badge_bg,
                                 &ctx.brushes.border,
                                 BADGE_APP.as_wide(),
@@ -799,8 +859,8 @@ impl Renderer {
                             right: size.width as f32 - 16.0,
                             bottom: top + 36.5,
                         },
-                        radiusX: 5.0,
-                        radiusY: 5.0,
+                        radiusX: theme.button_radius,
+                        radiusY: theme.button_radius,
                     };
                     target.FillRoundedRectangle(&action_rect, &ctx.brushes.badge_bg);
                     target.DrawRoundedRectangle(&action_rect, &ctx.brushes.badge_border, 1.0, None);
@@ -817,13 +877,13 @@ impl Renderer {
                         let admin_w = KEY_CAP_ADMIN.as_wide();
                         let admin_rect = D2D1_ROUNDED_RECT {
                             rect: D2D_RECT_F {
-                                left: size.width as f32 - 176.0,
+                                left: size.width as f32 - metrics::ADMIN_ZONE_FAR as f32,
                                 top: top + 13.5,
-                                right: size.width as f32 - 82.0,
+                                right: size.width as f32 - metrics::ADMIN_ZONE_NEAR as f32,
                                 bottom: top + 36.5,
                             },
-                            radiusX: 5.0,
-                            radiusY: 5.0,
+                            radiusX: theme.button_radius,
+                            radiusY: theme.button_radius,
                         };
                         target.FillRoundedRectangle(&admin_rect, &ctx.brushes.badge_bg);
                         target.DrawRoundedRectangle(
@@ -844,9 +904,6 @@ impl Renderer {
                 }
             }
 
-            // Any EndDraw failure discards the whole frame; drop every
-            // device-bound resource so the next frame rebuilds cleanly.
-            // Covers D2DERR_RECREATE_TARGET and wrong-resource-domain alike.
             if target.EndDraw(None, None).is_err() {
                 self.context = None;
                 icon_cache.cache.clear();

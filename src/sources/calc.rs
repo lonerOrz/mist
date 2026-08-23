@@ -1,18 +1,15 @@
 use crate::domain::Item;
 
-/// Expression evaluation
 pub fn eval(query: &str) -> Option<Item> {
-    let q = query.trim();
-    if !q.chars().any(|c| "+-*/^()".contains(c)) {
+    let q = query.trim().trim_end_matches('=').trim();
+    if !q.chars().any(|c| "+-*/^%()".contains(c)) {
         return None;
     }
 
-    // suffix ints with .0 so evalexpr keeps float semantics
     let res = evalexpr::eval(&floatify(q)).ok()?.to_string();
     Some(Item::new_calculator(&res))
 }
 
-// ponytail: hex literals unsupported; handle when needed
 fn floatify(q: &str) -> String {
     let mut out = String::with_capacity(q.len() + 8);
     let mut chars = q.chars().peekable();
@@ -60,11 +57,12 @@ fn floatify(q: &str) -> String {
 mod tests {
     use super::*;
 
-    /// arithmetic, exponentiation, float division, invalid input
     #[test]
     fn test_eval() {
         assert_eq!(&*eval("1 + 2 * 3").unwrap().name, "= 7");
         assert_eq!(&*eval("2^10").unwrap().name, "= 1024");
+        assert_eq!(&*eval("10 % 4").unwrap().name, "= 2");
+        assert_eq!(&*eval("1 + 2 * 3 =").unwrap().name, "= 7");
         assert_eq!(&*eval("5/2").unwrap().name, "= 2.5");
         assert!(eval("hello").is_none());
     }
