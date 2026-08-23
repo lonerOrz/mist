@@ -1,0 +1,171 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "Cargo.toml"
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: "Force rebuild and overwrite release assets if already exists"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    name: Check Version & Release Status
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.gatekeeper.outputs.should_release }}
+      version: ${{ steps.pkg_info.outputs.version }}
+      tag: ${{ steps.pkg_info.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract package version
+        id: pkg_info
+        run: |
+          PACKAGE="mist"
+          VERSION=$(cargo metadata --format-version 1 --no-deps | jq -er --arg pkg "$PACKAGE" '.packages[] | select(.name == $pkg) | .version')
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Target Package: $PACKAGE | Version: $VERSION | Tag: $TAG"
+
+      - name: Check if GitHub Release exists
+        id: gatekeeper
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.pkg_info.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists."
+            if [ "${{ inputs.force_release }}" = "true" ]; then
+              echo "force_release=true: Proceeding with overwrite."
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Skipping release (version unchanged)."
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "Release $TAG does not exist. Proceeding."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-and-release:
+    name: Build & Publish (Windows)
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Verify version invariant
+        shell: bash
+        run: |
+          PACKAGE="mist"
+          CHECK_VER=$(cargo metadata --format-version 1 --no-deps | jq -er --arg pkg "$PACKAGE" '.packages[] | select(.name == $pkg) | .version')
+          EXPECTED="${{ needs.check-version.outputs.version }}"
+          if [ "$CHECK_VER" != "$EXPECTED" ]; then
+            echo "::error::Version mismatch! Commit has $CHECK_VER but expected $EXPECTED"
+            exit 1
+          fi
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install cargo-wix
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-wix
+
+      - name: Compile release binary
+        shell: bash
+        run: |
+          cargo build --release --locked
+          mkdir -p dist
+
+      - name: Package Portable Zip
+        shell: bash
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          STAGE_DIR="dist/portable"
+          mkdir -p "$STAGE_DIR"
+
+          cp target/release/mist.exe "$STAGE_DIR/"
+          [ -f README.md ] && cp README.md "$STAGE_DIR/"
+          [ -f LICENSE ] && cp LICENSE "$STAGE_DIR/"
+
+          ZIP_NAME="mist-v${VERSION}-windows-x86_64-portable.zip"
+          powershell -Command "Compress-Archive -Path '$STAGE_DIR/*' -DestinationPath 'dist/$ZIP_NAME' -Force"
+
+      - name: Package MSI Installer
+        shell: bash
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          MSI_NAME="mist-v${VERSION}-windows-x86_64-installer.msi"
+
+          if [ ! -d "wix" ]; then
+            cargo wix init --force
+          fi
+
+          cargo wix -v --no-build --nocapture -o "dist/$MSI_NAME"
+
+      - name: Generate deterministic SHA256 checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum *.zip *.msi | sort > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cd ..
+
+      - name: Publish GitHub Release
+        id: publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.check-version.outputs.tag }}"
+
+          if [ "${{ inputs.force_release }}" = "true" ] && gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes
+          fi
+
+          gh release create "$TAG" \
+            --target "${{ github.sha }}" \
+            --title "Mist $TAG" \
+            --generate-notes \
+            dist/*.zip dist/*.msi dist/SHA256SUMS.txt
+
+      - name: Rollback on Failure
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.check-version.outputs.tag }}"
+          echo "::error::Release pipeline failed. Rolling back $TAG..."
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes || true
+          fi
+
+          if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
+            git push origin --delete "$TAG" || true
+          fi
