@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod calc;
+pub mod config;
 pub mod domain;
 pub mod history;
 pub mod indexer;
@@ -9,6 +10,7 @@ pub mod renderer;
 pub mod search;
 
 use app::{App, TIMER_ANIMATION};
+use config::Config;
 use domain::Item;
 use renderer::{Renderer, metrics};
 use windows::Win32::Foundation::*;
@@ -28,9 +30,53 @@ use windows::core::*;
 const HOTKEY_ID: i32 = 1001;
 const HOTKEY_FALLBACK_ID: i32 = 1002;
 const WM_INDEX_READY: u32 = WM_USER + 1;
+const WM_CONFIG_RELOADED: u32 = WM_USER + 2;
 const TIMER_CARET: usize = 1;
 
 static SURROGATE_PAIR: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+fn parse_hotkey(hotkey_str: &str) -> (HOT_KEY_MODIFIERS, VIRTUAL_KEY) {
+    let mut mods = HOT_KEY_MODIFIERS(MOD_NOREPEAT.0);
+    let parts: Vec<&str> = hotkey_str.split('+').map(|s| s.trim()).collect();
+    let mut vk = VK_SPACE;
+
+    for part in parts {
+        match part.to_lowercase().as_str() {
+            "ctrl" | "control" => mods.0 |= MOD_CONTROL.0,
+            "alt" => mods.0 |= MOD_ALT.0,
+            "shift" => mods.0 |= MOD_SHIFT.0,
+            "win" | "super" => mods.0 |= MOD_WIN.0,
+            "space" => vk = VK_SPACE,
+            "tab" => vk = VK_TAB,
+            _ => {
+                if let Some(c) = part.chars().next() {
+                    let code = c.to_ascii_uppercase() as u16;
+                    if (0x41..=0x5A).contains(&code) || (0x30..=0x39).contains(&code) {
+                        vk = VIRTUAL_KEY(code);
+                    }
+                }
+            }
+        }
+    }
+    (mods, vk)
+}
+
+fn apply_hotkeys(hwnd: HWND, hotkey_str: &str) {
+    unsafe {
+        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_FALLBACK_ID);
+
+        let (mods, vk) = parse_hotkey(hotkey_str);
+        if RegisterHotKey(Some(hwnd), HOTKEY_ID, mods, vk.0 as u32).is_err() {
+            let _ = RegisterHotKey(
+                Some(hwnd),
+                HOTKEY_FALLBACK_ID,
+                HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_NOREPEAT.0),
+                VK_SPACE.0 as u32,
+            );
+        }
+    }
+}
 
 fn main() -> Result<()> {
     unsafe {
@@ -39,7 +85,12 @@ fn main() -> Result<()> {
         let _guard = CreateMutexW(None, false, w!("SeliLauncherMutex"))?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
             if let Ok(existing) = FindWindowW(w!("SeliLauncherClass"), None) {
-                let _ = PostMessageW(existing, WM_HOTKEY, WPARAM(HOTKEY_ID as usize), LPARAM(0));
+                let _ = PostMessageW(
+                    Some(existing),
+                    WM_HOTKEY,
+                    WPARAM(HOTKEY_ID as usize),
+                    LPARAM(0),
+                );
             }
             return Ok(());
         }
@@ -48,6 +99,8 @@ fn main() -> Result<()> {
     if let Ok(home) = std::env::var("USERPROFILE") {
         let _ = std::env::set_current_dir(home);
     }
+
+    let config = Config::load_or_create();
 
     let args: Vec<String> = std::env::args().collect();
     let force_show = args
@@ -60,11 +113,14 @@ fn main() -> Result<()> {
         let instance = GetModuleHandleW(None)?;
         let class_name = w!("SeliLauncherClass");
 
+        let default_cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
+
         let wnd_class = WNDCLASSW {
             style: CS_DROPSHADOW,
             lpfnWndProc: Some(wnd_proc),
             hInstance: instance.into(),
             lpszClassName: class_name,
+            hCursor: default_cursor,
             hbrBackground: HBRUSH(std::ptr::null_mut()),
             ..Default::default()
         };
@@ -89,7 +145,7 @@ fn main() -> Result<()> {
             height,
             None,
             None,
-            instance,
+            Some(instance.into()),
             None,
         )?;
 
@@ -109,7 +165,6 @@ fn main() -> Result<()> {
             4,
         );
 
-        // DWMSBT_TRANSIENTWINDOW = 3 (Acrylic 材质，搜索框专属磨砂玻璃效果)
         const DWMSBT_TRANSIENTWINDOW: i32 = 3;
         let backdrop_type = DWMSBT_TRANSIENTWINDOW;
         let _ = DwmSetWindowAttribute(
@@ -127,31 +182,20 @@ fn main() -> Result<()> {
         };
         let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
 
-        // 修复 unused_mut 警告
-        let reg = RegisterHotKey(
-            hwnd,
-            HOTKEY_ID,
-            HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_NOREPEAT.0),
-            VK_SPACE.0 as u32,
-        );
-        if reg.is_err() {
-            let _ = RegisterHotKey(
-                hwnd,
-                HOTKEY_FALLBACK_ID,
-                HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_NOREPEAT.0),
-                VK_SPACE.0 as u32,
-            );
-        }
+        apply_hotkeys(hwnd, &config.hotkey);
 
         hwnd
     };
 
-    let renderer = Renderer::new()?;
-    let app = Box::new(App::new(renderer));
+    let renderer = Renderer::new(config.font_family.clone())?;
+    let app = Box::new(App::new(renderer, config));
 
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
     }
+
+    // Start config hot reload watcher
+    Config::watch_and_notify(hwnd, WM_CONFIG_RELOADED);
 
     let hwnd_raw = hwnd.0 as isize;
     std::thread::spawn(move || {
@@ -160,7 +204,7 @@ fn main() -> Result<()> {
         let target_hwnd = HWND(hwnd_raw as *mut _);
         let ptr = LPARAM(Box::into_raw(boxed_items) as isize);
         unsafe {
-            let _ = PostMessageW(target_hwnd, WM_INDEX_READY, WPARAM(0), ptr);
+            let _ = PostMessageW(Some(target_hwnd), WM_INDEX_READY, WPARAM(0), ptr);
         }
     });
 
@@ -192,17 +236,43 @@ unsafe extern "system" fn wnd_proc(
     match msg {
         WM_ERASEBKGND => LRESULT(1),
 
+        WM_SETCURSOR => {
+            let hit_test = (lparam.0 & 0xffff) as i32;
+            if hit_test == 1 {
+                let mut pt = POINT::default();
+                let _ = unsafe { GetCursorPos(&mut pt) };
+                let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
+
+                // I-beam over the input area, standard arrow elsewhere.
+                let cursor_id = if pt.y >= 0
+                    && pt.y < metrics::HEADER_HEIGHT
+                    && pt.x as f32 >= metrics::INPUT_X
+                {
+                    IDC_IBEAM
+                } else {
+                    IDC_ARROW
+                };
+
+                unsafe {
+                    let cursor = LoadCursorW(None, cursor_id).unwrap_or_default();
+                    SetCursor(Some(cursor));
+                }
+                return LRESULT(1);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
         WM_NCCALCSIZE => {
             if wparam.0 != 0 {
                 LRESULT(0)
             } else {
-                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) } // 修复 E0133
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
         }
 
         WM_CREATE => {
             unsafe {
-                let _ = SetTimer(hwnd, TIMER_CARET, 1500, None);
+                let _ = SetTimer(Some(hwnd), TIMER_CARET, 1500, None);
             }
             LRESULT(0)
         }
@@ -213,6 +283,21 @@ unsafe extern "system" fn wnd_proc(
                 if let Some(app) = app_opt {
                     app.set_index(*boxed);
                     app.on_query_change(hwnd);
+                }
+                // Indexing is done; hand scan-time heap pages back to the OS.
+                unsafe {
+                    let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+                }
+            }
+            LRESULT(0)
+        }
+
+        WM_CONFIG_RELOADED => {
+            if lparam.0 != 0 {
+                let boxed = unsafe { Box::from_raw(lparam.0 as *mut Config) };
+                apply_hotkeys(hwnd, &boxed.hotkey);
+                if let Some(app) = app_opt {
+                    app.update_config(hwnd, *boxed);
                 }
             }
             LRESULT(0)
@@ -314,13 +399,13 @@ unsafe extern "system" fn wnd_proc(
                 {
                     app.caret_visible = !app.caret_visible;
                     let rect = RECT {
-                        left: 40,
-                        top: 10,
+                        left: metrics::INPUT_X as i32,
+                        top: 0,
                         right: metrics::WINDOW_WIDTH - 20,
-                        bottom: 48,
+                        bottom: metrics::HEADER_HEIGHT,
                     };
                     unsafe {
-                        let _ = InvalidateRect(hwnd, Some(&rect), false);
+                        let _ = InvalidateRect(Some(hwnd), Some(&rect), false);
                     }
                 }
             } else if wparam.0 == TIMER_ANIMATION
@@ -328,11 +413,11 @@ unsafe extern "system" fn wnd_proc(
             {
                 if app.spring_animating {
                     unsafe {
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 } else {
                     unsafe {
-                        let _ = KillTimer(hwnd, TIMER_ANIMATION);
+                        let _ = KillTimer(Some(hwnd), TIMER_ANIMATION);
                     }
                 }
             }
@@ -360,7 +445,7 @@ unsafe extern "system" fn wnd_proc(
             if let Some(app) = app_opt {
                 app.hovered = None;
                 unsafe {
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)
@@ -380,21 +465,21 @@ unsafe extern "system" fn wnd_proc(
                 app.render_current_frame(hwnd);
             }
             unsafe {
-                let _ = ValidateRect(hwnd, None);
+                let _ = ValidateRect(Some(hwnd), None);
             }
             LRESULT(0)
         }
 
         WM_DESTROY => {
             unsafe {
-                let _ = UnregisterHotKey(hwnd, HOTKEY_ID);
-                let _ = UnregisterHotKey(hwnd, HOTKEY_FALLBACK_ID);
-                let _ = KillTimer(hwnd, TIMER_CARET);
-                let _ = KillTimer(hwnd, TIMER_ANIMATION);
+                let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+                let _ = UnregisterHotKey(Some(hwnd), HOTKEY_FALLBACK_ID);
+                let _ = KillTimer(Some(hwnd), TIMER_CARET);
+                let _ = KillTimer(Some(hwnd), TIMER_ANIMATION);
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
                 if !ptr.is_null() {
                     drop(Box::from_raw(ptr));
-                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                    let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 }
                 PostQuitMessage(0);
             }
@@ -427,7 +512,7 @@ unsafe fn toggle_window(hwnd: HWND) {
 
                 let _ = SetWindowPos(
                     hwnd,
-                    HWND_TOPMOST,
+                    Some(HWND_TOPMOST),
                     0,
                     0,
                     metrics::WINDOW_WIDTH,
@@ -439,6 +524,7 @@ unsafe fn toggle_window(hwnd: HWND) {
                 let _ = app.renderer.render(
                     hwnd,
                     &app.query,
+                    &app.config.placeholder,
                     &items,
                     app.selected,
                     app.caret_visible,
@@ -448,7 +534,7 @@ unsafe fn toggle_window(hwnd: HWND) {
             }
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = SetForegroundWindow(hwnd);
-            let _ = SetFocus(hwnd);
+            let _ = SetFocus(Some(hwnd));
         }
     }
 }

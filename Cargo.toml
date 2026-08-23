@@ -6,18 +6,20 @@ authors = ["lonerOrz"]
 description = "Fast, minimal Windows launcher"
 
 [dependencies]
-evalexpr = "12.0"
-pinyin = "0.10"
+evalexpr = "13.1"
+pinyin = "0.11"
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.1"
+windows-numerics = "0.3"
+notify = "8.2"
 
 [dependencies.windows]
-version = "0.58"
+version = "0.62"
 features = [
-    "Foundation_Numerics",
     "Win32_Foundation",
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_DirectWrite",
-    "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Imaging",
@@ -41,8 +43,8 @@ features = [
 ]
 
 [profile.release]
-opt-level = "z"      # 开启针对体积的极致优化
-lto = true           # 开启全局链接时优化
-codegen-units = 1    # 单个生成单元，最大化优化力度
-panic = "abort"      # 剥离 panic 展开表和落地代码
-strip = true         # 自动剔除所有调试符号与元数据
+opt-level = "z"      # Aggressive size optimization
+lto = true           # Whole-program link-time optimization
+codegen-units = 1    # Single codegen unit for maximum optimization
+panic = "abort"      # Drop unwind tables and landing pads
+strip = true         # Strip debug symbols and metadata

@@ -1,6 +1,6 @@
+use crate::config;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
 use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,10 +30,7 @@ impl Drop for History {
 
 impl History {
     pub fn load() -> Self {
-        let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-        let dir = PathBuf::from(appdata).join("mist");
-        let _ = fs::create_dir_all(&dir);
-        let file_path = dir.join("history.txt");
+        let file_path = config::get_mist_dir().join("history.txt");
 
         let mut records = HashMap::new();
         if let Ok(content) = fs::read_to_string(&file_path) {

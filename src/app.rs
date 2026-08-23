@@ -1,15 +1,18 @@
 use crate::calc;
+use crate::config::Config;
 use crate::domain::Item;
 use crate::history::History;
 use crate::renderer::{Renderer, Spring, metrics};
 use crate::search;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const TIMER_ANIMATION: usize = 2;
 
 pub struct App {
+    pub config: Config,
     pub index: Vec<Item>,
     pub query: String,
     pub results: Vec<Item>,
@@ -24,8 +27,9 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(renderer: Renderer) -> Self {
+    pub fn new(renderer: Renderer, config: Config) -> Self {
         Self {
+            config,
             index: Vec::new(),
             query: String::new(),
             results: Vec::new(),
@@ -40,8 +44,32 @@ impl App {
         }
     }
 
-    pub fn set_index(&mut self, items: Vec<Item>) {
+    pub fn set_index(&mut self, mut items: Vec<Item>) {
+        if !items
+            .iter()
+            .any(|i| matches!(i.kind, crate::domain::ItemKind::Config))
+        {
+            items.push(Item::new_config());
+        }
+        if !items
+            .iter()
+            .any(|i| matches!(i.kind, crate::domain::ItemKind::Exit))
+        {
+            items.push(Item::new_exit());
+        }
         self.index = items;
+    }
+
+    pub fn update_config(&mut self, hwnd: HWND, new_config: Config) {
+        if self.config.font_family != new_config.font_family {
+            self.renderer
+                .set_font_family(new_config.font_family.clone());
+        }
+        self.config = new_config;
+        self.on_query_change(hwnd);
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
     }
 
     pub fn on_query_change(&mut self, hwnd: HWND) {
@@ -51,9 +79,12 @@ impl App {
         self.results.clear();
 
         if !q.is_empty() {
-            let calc_item = calc::eval(q);
-            if let Some(c) = &calc_item {
-                self.results.push(c.clone());
+            let mut calc_item = None;
+            if self.config.enable_calc {
+                calc_item = calc::eval(q);
+                if let Some(c) = &calc_item {
+                    self.results.push(c.clone());
+                }
             }
 
             let q_lower = q.to_lowercase();
@@ -69,12 +100,12 @@ impl App {
                 }
             }
             scored.sort_by_key(|a| std::cmp::Reverse(a.1));
-            scored.truncate(8);
+            scored.truncate(self.config.max_results);
             for (idx, _) in scored {
                 self.results.push(self.index[idx].clone());
             }
 
-            if !has_exact_app && calc_item.is_none() {
+            if self.config.enable_command && !has_exact_app && calc_item.is_none() {
                 self.results.push(Item::new_command(q));
             }
         }
@@ -103,7 +134,7 @@ impl App {
         if self.results.is_empty() || y < metrics::LIST_TOP {
             if self.hovered.take().is_some() {
                 unsafe {
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             return;
@@ -131,10 +162,12 @@ impl App {
 
             let item = &self.results[idx];
             let is_calc = matches!(item.kind, crate::domain::ItemKind::Calculator { .. });
-            let admin_min_x = (metrics::WINDOW_WIDTH - 176) as f32;
-            let admin_max_x = (metrics::WINDOW_WIDTH - 82) as f32;
+            let is_cfg = matches!(item.kind, crate::domain::ItemKind::Config);
+            let is_exit = matches!(item.kind, crate::domain::ItemKind::Exit);
+            let admin_min_x = (metrics::WINDOW_WIDTH - metrics::ADMIN_ZONE_FAR) as f32;
+            let admin_max_x = (metrics::WINDOW_WIDTH - metrics::ADMIN_ZONE_NEAR) as f32;
 
-            if !is_calc && x >= admin_min_x && x <= admin_max_x {
+            if !is_calc && !is_cfg && !is_exit && x >= admin_min_x && x <= admin_max_x {
                 self.execute_selected_admin(hwnd);
             } else {
                 self.execute_selected(hwnd);
@@ -174,7 +207,7 @@ impl App {
         unsafe {
             let _ = SetWindowPos(
                 hwnd,
-                HWND_TOPMOST,
+                Some(HWND_TOPMOST),
                 0,
                 0,
                 metrics::WINDOW_WIDTH,
@@ -182,6 +215,9 @@ impl App {
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
             );
             let _ = ShowWindow(hwnd, SW_HIDE);
+
+            // Hidden = idle; hand resident pages back to the OS.
+            let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
         }
     }
 
@@ -195,7 +231,7 @@ impl App {
             unsafe {
                 let _ = SetWindowPos(
                     hwnd,
-                    HWND_TOPMOST,
+                    Some(HWND_TOPMOST),
                     0,
                     0,
                     metrics::WINDOW_WIDTH,
@@ -215,6 +251,7 @@ impl App {
             let _ = self.renderer.render(
                 hwnd,
                 &self.query,
+                &self.config.placeholder,
                 &items,
                 self.selected,
                 self.caret_visible,
@@ -227,8 +264,8 @@ impl App {
     pub fn trigger_animation(&mut self, hwnd: HWND) {
         self.spring_animating = true;
         unsafe {
-            let _ = SetTimer(hwnd, TIMER_ANIMATION, 16, None);
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = SetTimer(Some(hwnd), TIMER_ANIMATION, 16, None);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
     }
 

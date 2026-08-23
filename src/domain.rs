@@ -1,3 +1,4 @@
+use crate::config;
 use std::path::Path;
 use std::sync::Arc;
 use windows::Win32::Foundation::*;
@@ -5,7 +6,9 @@ use windows::Win32::System::DataExchange::*;
 use windows::Win32::System::Memory::*;
 use windows::Win32::System::Ole::*;
 use windows::Win32::UI::Shell::*;
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::Win32::UI::WindowsAndMessaging::{
+    AllowSetForegroundWindow, PostQuitMessage, SW_SHOWNORMAL,
+};
 use windows::core::*;
 
 /// UTF-16 with NUL terminator for Win32 APIs.
@@ -22,6 +25,7 @@ pub(crate) fn to_wide_slice(s: &str) -> Vec<u16> {
 pub enum Action {
     Launch(Arc<str>),
     CopyText(Arc<str>),
+    ExitApp,
 }
 
 impl Action {
@@ -35,8 +39,16 @@ impl Action {
 
     fn run(&self, as_admin: bool) {
         match self {
+            Action::ExitApp => unsafe {
+                PostQuitMessage(0);
+            },
             Action::Launch(path) => {
                 let path_str = &**path;
+
+                // Allow the newly launched process to steal foreground focus
+                unsafe {
+                    let _ = AllowSetForegroundWindow(0xFFFFFFFF);
+                }
 
                 // cmd.exe /k or /c command
                 let (file, params, working_dir) =
@@ -98,7 +110,6 @@ impl Action {
 
                 unsafe {
                     if let Err(e) = ShellExecuteExW(&mut exec_info) {
-                        // stderr is invisible in a GUI build; useful under wine
                         eprintln!("ShellExecuteExW failed: {e:?}, file: {file}");
                     }
                 }
@@ -143,14 +154,14 @@ fn set_clipboard(text: &str) {
                 let _ = GlobalUnlock(hmem);
                 // free only if the clipboard didn't take ownership
                 let delivered = matches!(
-                    SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(hmem.0)),
+                    SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hmem.0))),
                     Ok(h) if !h.0.is_null()
                 );
                 if !delivered {
-                    let _ = GlobalFree(hmem);
+                    let _ = GlobalFree(Some(hmem));
                 }
             } else {
-                let _ = GlobalFree(hmem);
+                let _ = GlobalFree(Some(hmem));
             }
         }
     }
@@ -184,6 +195,8 @@ pub enum ItemKind {
     Application,
     Calculator { result: Arc<str> },
     Command { raw: Arc<str> },
+    Config,
+    Exit,
 }
 
 #[derive(Debug, Clone)]
@@ -250,6 +263,35 @@ impl Item {
             },
             priority_penalty: 0,
             action: Action::Launch(action_str),
+        }
+    }
+
+    pub fn new_config() -> Self {
+        let cfg_path = config::get_config_path();
+        let path_str = cfg_path.to_string_lossy().to_string();
+        let path_arc: Arc<str> = Arc::from(path_str.as_str());
+        Self {
+            name: Arc::from("Open Config (config.toml)"),
+            name_lower: Arc::from("config configuration settings preference"),
+            keywords_lower: Arc::from("options"),
+            pinyin_abbr: Arc::from(""),
+            path: path_arc.clone(),
+            kind: ItemKind::Config,
+            priority_penalty: 0,
+            action: Action::Launch(path_arc),
+        }
+    }
+
+    pub fn new_exit() -> Self {
+        Self {
+            name: Arc::from("Exit Mist"),
+            name_lower: Arc::from("exit mist quit"),
+            keywords_lower: Arc::from(":q close"),
+            pinyin_abbr: Arc::from(""),
+            path: Arc::from("Quit the launcher process"),
+            kind: ItemKind::Exit,
+            priority_penalty: 0,
+            action: Action::ExitApp,
         }
     }
 }

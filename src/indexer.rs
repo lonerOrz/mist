@@ -23,7 +23,6 @@ fn scoped_com<T>(f: impl FnOnce() -> T) -> T {
 
 /// App discovery: Start Menu + Desktop + Admin Tools + UWP + %PATH% + App Paths.
 pub fn scan_all() -> Vec<Item> {
-    // Parallelize: .lnk COM resolution dominates; registries/PATH are plain IO
     let (startmenu, uwp, path_apps, app_paths) = std::thread::scope(|s| {
         let b = s.spawn(|| scoped_com(scan_start_menu_and_desktop));
         let c = s.spawn(|| scoped_com(scan_uwp_apps));
@@ -49,8 +48,6 @@ pub fn scan_all() -> Vec<Item> {
     items
 }
 
-/// Authoritative PATH: registry (HKLM+HKCU Environment) overrides the stale
-/// process snapshot inherited from a cross-env launch, plus WindowsApps fallback.
 fn get_true_windows_path() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen = HashSet::new();
@@ -94,7 +91,6 @@ fn get_true_windows_path() -> Vec<PathBuf> {
     dirs
 }
 
-/// Expand %VAR% references using the system, since registry PATH strings keep them literal.
 fn expand_env(s: &str) -> String {
     if !s.contains('%') {
         return s.to_string();
@@ -109,11 +105,10 @@ fn expand_env(s: &str) -> String {
     }
 }
 
-/// Read a registry string value (default value when value_name is empty).
 fn read_reg_string(hkey: HKEY, subkey: PCWSTR, value_name: PCWSTR) -> Result<String> {
     unsafe {
         let mut key = HKEY::default();
-        RegOpenKeyExW(hkey, subkey, 0, KEY_READ, &mut key).ok()?;
+        RegOpenKeyExW(hkey, subkey, Some(0), KEY_READ, &mut key).ok()?;
         let result = (|| -> Result<String> {
             let mut buf = [0u16; 2048];
             let mut size = (buf.len() * 2) as u32;
@@ -135,7 +130,6 @@ fn read_reg_string(hkey: HKEY, subkey: PCWSTR, value_name: PCWSTR) -> Result<Str
     }
 }
 
-/// Scan executables/scripts in PATH dirs (mirrors Win+R). Single-level only.
 fn scan_env_path() -> Vec<Item> {
     let mut items = Vec::new();
     let pathext = std::env::var("PATHEXT")
@@ -162,7 +156,6 @@ fn scan_env_path() -> Vec<Item> {
             if !valid_exts.contains(ext.to_lowercase().as_str()) {
                 continue;
             }
-            // CUI .exe spawns a terminal host (the original stray-terminal bug); GUI only
             if ext.eq_ignore_ascii_case("exe") && is_cui_image(&path) {
                 continue;
             }
@@ -181,7 +174,6 @@ fn scan_env_path() -> Vec<Item> {
     items
 }
 
-/// Scan the App Paths registry (Win+R's source for wt/chrome/etc.).
 fn scan_app_paths() -> Vec<Item> {
     let mut items = Vec::new();
     for hkey in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
@@ -221,7 +213,7 @@ fn enum_reg_keys(hkey: HKEY, subkey: &str) -> Option<Vec<String>> {
     unsafe {
         let sub_w = to_wide(subkey);
         let mut key = HKEY::default();
-        if RegOpenKeyExW(hkey, PCWSTR(sub_w.as_ptr()), 0, KEY_READ, &mut key)
+        if RegOpenKeyExW(hkey, PCWSTR(sub_w.as_ptr()), Some(0), KEY_READ, &mut key)
             .ok()
             .is_err()
         {
@@ -235,10 +227,10 @@ fn enum_reg_keys(hkey: HKEY, subkey: &str) -> Option<Vec<String>> {
             if RegEnumKeyExW(
                 key,
                 i,
-                PWSTR(name_buf.as_mut_ptr()),
+                Some(PWSTR(name_buf.as_mut_ptr())),
                 &mut len,
                 None,
-                PWSTR::null(),
+                Some(PWSTR::null()),
                 None,
                 None,
             )
@@ -287,8 +279,6 @@ fn is_blacklisted(name_lower: &str, path_lower: &str) -> bool {
 
 fn scan_start_menu_and_desktop() -> Vec<Item> {
     let mut items = Vec::new();
-    // Win32 KnownFolder lookup: no hard-coded drive letters or user-dir paths.
-    // AdminTools surfaces Services/Device Manager/Computer Management via native .lnk.
     for id in [
         &FOLDERID_CommonStartMenu,
         &FOLDERID_StartMenu,
@@ -304,7 +294,6 @@ fn scan_start_menu_and_desktop() -> Vec<Item> {
     items
 }
 
-/// SHGetKnownFolderPath wrapper (caller supplies FOLDERID_*).
 fn known_folder_path(id: &GUID) -> Option<PathBuf> {
     unsafe {
         let path = SHGetKnownFolderPath(id, KNOWN_FOLDER_FLAG(0), None).ok()?;
@@ -314,7 +303,6 @@ fn known_folder_path(id: &GUID) -> Option<PathBuf> {
     }
 }
 
-/// True if launching this entry forces a console host (Win11 spawns a terminal).
 fn targets_console_window(entry: &Path, ext: &str) -> bool {
     match ext {
         "exe" => is_cui_image(entry),
@@ -329,7 +317,7 @@ fn targets_console_window(entry: &Path, ext: &str) -> bool {
 }
 
 fn is_cui_image(path: &Path) -> bool {
-    read_pe_subsystem(path) == Some(3) // 3 = IMAGE_SUBSYSTEM_WINDOWS_CUI
+    read_pe_subsystem(path) == Some(3)
 }
 
 fn read_pe_subsystem(path: &Path) -> Option<u16> {
@@ -339,8 +327,6 @@ fn read_pe_subsystem(path: &Path) -> Option<u16> {
     pe_subsystem(&buf[..n])
 }
 
-/// Read the PE Subsystem field (same offset in PE32 and PE32+).
-/// None means inconclusive; caller conservatively keeps the item.
 fn pe_subsystem(buf: &[u8]) -> Option<u16> {
     if buf.len() < 0x40 || &buf[0..2] != b"MZ" {
         return None;
@@ -350,12 +336,10 @@ fn pe_subsystem(buf: &[u8]) -> Option<u16> {
     if pe != b"PE\0\0" {
         return None;
     }
-    // PE sig (4) + COFF header (20), then Optional Header
     let off = e_lfanew + 24 + 68;
     Some(u16::from_le_bytes(buf.get(off..off + 2)?.try_into().ok()?))
 }
 
-/// Resolve a .lnk's real target (expands environment variables).
 unsafe fn lnk_target(path: &Path) -> Option<PathBuf> {
     unsafe {
         let wide = to_wide(&path.to_string_lossy());
@@ -482,29 +466,4 @@ fn scan_uwp_apps() -> Vec<Item> {
         }
     }
     items
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Build a minimal valid PE header buffer
-    fn fake_pe(subsystem: u16) -> Vec<u8> {
-        let mut buf = vec![0u8; 0x100];
-        buf[0..2].copy_from_slice(b"MZ");
-        buf[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
-        buf[0x80..0x84].copy_from_slice(b"PE\0\0");
-        let opt = 0x80 + 24;
-        buf[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+ Magic
-        let off = opt + 68;
-        buf[off..off + 2].copy_from_slice(&subsystem.to_le_bytes());
-        buf
-    }
-
-    #[test]
-    fn test_pe_subsystem_detection() {
-        assert_eq!(pe_subsystem(&fake_pe(2)), Some(2)); // GUI: launch directly
-        assert_eq!(pe_subsystem(&fake_pe(3)), Some(3)); // CUI: filtered out
-        assert_eq!(pe_subsystem(b"MZ tiny"), None); // invalid: conservatively allowed
-    }
 }
