@@ -81,7 +81,6 @@ impl App {
         self.hovered = None;
 
         self.results = QueryPipeline::query(&self.query, &self.index, &self.history, &self.config);
-
         self.pill.reset(metrics::LIST_TOP);
         self.update_window_geometry(hwnd);
     }

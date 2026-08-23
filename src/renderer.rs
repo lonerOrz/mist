@@ -1,16 +1,16 @@
 use crate::domain::{Item, ItemKind, to_wide, to_wide_slice};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
-use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ, HPALETTE};
 use windows::Win32::Graphics::Imaging::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Shell::*;
+use windows::Win32::UI::Shell::{SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGetFileInfoW};
+use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::*;
 use windows_numerics::Vector2;
@@ -46,13 +46,49 @@ impl Theme {
     }
 }
 
-const BADGE_FX: PCWSTR = w!("\u{f1ec}");
-const BADGE_CMD: PCWSTR = w!("\u{f120}");
-const BADGE_CFG: PCWSTR = w!("\u{f013}");
-const BADGE_APP: PCWSTR = w!("\u{f009}");
-const BADGE_EXIT: PCWSTR = w!("\u{f011}");
-const BADGE_WEB: PCWSTR = w!("\u{f0ac}");
-const BADGE_PATH: PCWSTR = w!("\u{f07b}");
+struct BadgeGlyphs {
+    nerd: PCWSTR,
+    fluent: PCWSTR,
+}
+
+const ICON_FX: BadgeGlyphs = BadgeGlyphs {
+    nerd: w!("\u{f1ec}"),
+    fluent: w!("\u{e1d0}"),
+};
+const ICON_CMD: BadgeGlyphs = BadgeGlyphs {
+    nerd: w!("\u{f120}"),
+    fluent: w!("\u{e756}"),
+};
+const ICON_CFG: BadgeGlyphs = BadgeGlyphs {
+    nerd: w!("\u{f013}"),
+    fluent: w!("\u{e713}"),
+};
+const ICON_APP: BadgeGlyphs = BadgeGlyphs {
+    nerd: w!("\u{f009}"),
+    fluent: w!("\u{e71d}"),
+};
+const ICON_EXIT: BadgeGlyphs = BadgeGlyphs {
+    nerd: w!("\u{f011}"),
+    fluent: w!("\u{e7e8}"),
+};
+const ICON_WEB: BadgeGlyphs = BadgeGlyphs {
+    nerd: w!("\u{f0ac}"),
+    fluent: w!("\u{e774}"),
+};
+const ICON_PATH: BadgeGlyphs = BadgeGlyphs {
+    nerd: w!("\u{f07b}"),
+    fluent: w!("\u{e8b7}"),
+};
+
+fn pick_glyph(g: &BadgeGlyphs, is_nerd: bool) -> &[u16] {
+    unsafe {
+        if is_nerd {
+            g.nerd.as_wide()
+        } else {
+            g.fluent.as_wide()
+        }
+    }
+}
 const KEY_CAP_COPY: PCWSTR = w!("↵ Copy");
 const KEY_CAP_RUN: PCWSTR = w!("↵ Run");
 const KEY_CAP_OPEN: PCWSTR = w!("↵ Open");
@@ -64,9 +100,95 @@ pub fn window_scale(hwnd: HWND) -> f32 {
     (unsafe { GetDpiForWindow(hwnd) as f32 }) / 96.0
 }
 
+fn family_exists(dwrite_factory: &IDWriteFactory, family: PCWSTR) -> bool {
+    unsafe {
+        let mut collection: Option<IDWriteFontCollection> = None;
+        if dwrite_factory
+            .GetSystemFontCollection(&mut collection, false)
+            .is_err()
+        {
+            return false;
+        }
+        let Some(collection) = collection else {
+            return false;
+        };
+        let mut index = 0u32;
+        let mut exists = BOOL(0);
+        collection
+            .FindFamilyName(family, &mut index, &mut exists)
+            .is_ok()
+            && exists.as_bool()
+    }
+}
+
+fn probe_nerd_font_support(dwrite_factory: &IDWriteFactory, font_family: &str) -> bool {
+    let lower = font_family.to_lowercase();
+    if lower.contains("nerd") || lower.contains(" nf") || lower.ends_with("nf") {
+        return true;
+    }
+
+    unsafe {
+        if !family_exists(dwrite_factory, PCWSTR(to_wide(font_family).as_ptr())) {
+            return false;
+        }
+
+        let mut collection: Option<IDWriteFontCollection> = None;
+        if dwrite_factory
+            .GetSystemFontCollection(&mut collection, false)
+            .is_err()
+        {
+            return false;
+        }
+        let Some(collection) = collection else {
+            return false;
+        };
+        let family_w = to_wide(font_family);
+        let mut index = 0u32;
+        let mut exists = BOOL(0);
+        if collection
+            .FindFamilyName(PCWSTR(family_w.as_ptr()), &mut index, &mut exists)
+            .is_err()
+            || !exists.as_bool()
+        {
+            return false;
+        }
+
+        let Ok(family) = collection.GetFontFamily(index) else {
+            return false;
+        };
+        let Ok(font) = family.GetFirstMatchingFont(
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL,
+        ) else {
+            return false;
+        };
+
+        let Ok(font_face) = font.CreateFontFace() else {
+            return false;
+        };
+
+        let test_codepoints = [0xF120u32, 0xF013u32];
+        let mut glyph_indices = [0u16; 2];
+        if font_face
+            .GetGlyphIndices(
+                test_codepoints.as_ptr(),
+                test_codepoints.len() as u32,
+                glyph_indices.as_mut_ptr(),
+            )
+            .is_err()
+        {
+            return false;
+        }
+
+        glyph_indices.iter().all(|&idx| idx != 0)
+    }
+}
+
 pub struct IconCache {
     wic_factory: IWICImagingFactory,
     cache: HashMap<Arc<str>, Option<ID2D1Bitmap>>,
+    loading: HashSet<Arc<str>>,
 }
 
 impl IconCache {
@@ -76,6 +198,7 @@ impl IconCache {
         Ok(Self {
             wic_factory,
             cache: HashMap::new(),
+            loading: HashSet::new(),
         })
     }
 
@@ -92,8 +215,12 @@ impl IconCache {
         if let Some(bm) = self.cache.get(&key) {
             return bm.clone();
         }
-
+        if self.loading.contains(&key) {
+            return None;
+        }
+        self.loading.insert(key.clone());
         let loaded = unsafe { self.load_shell_icon(rt, path, px) };
+        self.loading.remove(&key);
         self.cache.insert(key, loaded.clone());
         if self.cache.len() > 512 {
             self.cache.clear();
@@ -105,34 +232,28 @@ impl IconCache {
         &self,
         rt: &ID2D1RenderTarget,
         path: &str,
-        px: u32,
+        _px: u32,
     ) -> Option<ID2D1Bitmap> {
         unsafe {
             let path_w = to_wide(path);
-            let shell_item: IShellItem =
-                SHCreateItemFromParsingName(PCWSTR(path_w.as_ptr()), None).ok()?;
-            let image_factory: IShellItemImageFactory = shell_item.cast().ok()?;
+            let mut sfi = SHFILEINFOW::default();
 
-            let hbitmap = image_factory
-                .GetImage(
-                    SIZE {
-                        cx: px as i32,
-                        cy: px as i32,
-                    },
-                    SIIGBF_BIGGERSIZEOK | SIIGBF_ICONONLY,
-                )
-                .ok()?;
-
-            let wic_bitmap = self.wic_factory.CreateBitmapFromHBITMAP(
-                hbitmap,
-                HPALETTE::default(),
-                WICBitmapUseAlpha,
+            let res = SHGetFileInfoW(
+                PCWSTR(path_w.as_ptr()),
+                windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
+                Some(&mut sfi),
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                SHGFI_ICON | SHGFI_LARGEICON,
             );
-            let _ = DeleteObject(HGDIOBJ(hbitmap.0 as _));
 
-            let wic_bitmap = wic_bitmap.ok()?;
+            if res == 0 || sfi.hIcon.is_invalid() {
+                return None;
+            }
+
+            let wic_bitmap = self.wic_factory.CreateBitmapFromHICON(sfi.hIcon).ok()?;
+            let _ = DestroyIcon(sfi.hIcon);
+
             let converter = self.wic_factory.CreateFormatConverter().ok()?;
-
             converter
                 .Initialize(
                     &wic_bitmap,
@@ -159,22 +280,30 @@ unsafe fn draw_badge_icon(
     brush: &ID2D1SolidColorBrush,
     text: &[u16],
     rect: &D2D_RECT_F,
+    is_nerd_font: bool,
 ) {
     unsafe {
-        let Ok(layout) = dwrite_factory.CreateTextLayout(
-            text,
-            format,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
-        ) else {
+        let box_w = rect.right - rect.left;
+        let box_h = rect.bottom - rect.top;
+
+        let Ok(layout) = dwrite_factory.CreateTextLayout(text, format, box_w, box_h) else {
             return;
         };
 
         let mut m = DWRITE_TEXT_METRICS::default();
         let _ = layout.GetMetrics(&mut m);
 
-        let draw_x = rect.left + ((rect.right - rect.left) - m.width) / 2.0 - m.left;
-        let draw_y = rect.top + ((rect.bottom - rect.top) - m.height) / 2.0;
+        let draw_x = if is_nerd_font {
+            rect.left + (box_w - m.width) / 2.0 - m.left - 1.0
+        } else {
+            rect.left + (box_w - m.width) / 2.0 - m.left
+        };
+
+        let draw_y = if is_nerd_font {
+            rect.top + (box_h - m.height) / 2.0 + 1.2
+        } else {
+            rect.top + (box_h - m.height) / 2.0
+        };
 
         target.DrawTextLayout(
             Vector2::new(draw_x, draw_y),
@@ -199,6 +328,7 @@ unsafe fn draw_badge(
     border: &ID2D1SolidColorBrush,
     glyph: &[u16],
     glyph_brush: &ID2D1SolidColorBrush,
+    is_nerd_font: bool,
 ) {
     let badge = D2D1_ROUNDED_RECT {
         rect: *rect,
@@ -208,7 +338,15 @@ unsafe fn draw_badge(
     unsafe {
         target.FillRoundedRectangle(&badge, bg);
         target.DrawRoundedRectangle(&badge, border, 1.0, None);
-        draw_badge_icon(target, dwrite_factory, icon_fmt, glyph_brush, glyph, rect);
+        draw_badge_icon(
+            target,
+            dwrite_factory,
+            icon_fmt,
+            glyph_brush,
+            glyph,
+            rect,
+            is_nerd_font,
+        );
     }
 }
 
@@ -241,6 +379,7 @@ pub struct D2DContext {
     brushes: BrushSet,
     formats: FormatSet,
     applied_size: D2D_SIZE_U,
+    is_nerd_font: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -430,12 +569,37 @@ impl Renderer {
                     .or_else(|_| try_family(PCWSTR(w!("Segoe UI").as_ptr())))
             };
 
+            let is_nerd_font = probe_nerd_font_support(&self.dwrite_factory, &self.font_family);
+
+            let badge_icon_format = if is_nerd_font {
+                mk_format(&self.font_family, DWRITE_FONT_WEIGHT_NORMAL, 13.5)?
+            } else {
+                let candidates = [
+                    w!("Segoe Fluent Icons"),
+                    w!("Segoe MDL2 Assets"),
+                    w!("Segoe UI Symbol"),
+                ];
+                let picked = candidates
+                    .iter()
+                    .find(|f| family_exists(&self.dwrite_factory, **f))
+                    .unwrap_or(&candidates[2]);
+                self.dwrite_factory.CreateTextFormat(
+                    *picked,
+                    None,
+                    DWRITE_FONT_WEIGHT_NORMAL,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    13.5,
+                    w!("en-us"),
+                )?
+            };
+
             let formats = FormatSet {
                 input: mk_format(&self.font_family, DWRITE_FONT_WEIGHT_NORMAL, 18.0)?,
                 item_title: mk_format(&self.font_family, DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0)?,
                 item_sub: mk_format(&self.font_family, DWRITE_FONT_WEIGHT_NORMAL, 11.5)?,
                 badge: mk_format(&self.font_family, DWRITE_FONT_WEIGHT_SEMI_BOLD, 10.5)?,
-                badge_icon: mk_format(&self.font_family, DWRITE_FONT_WEIGHT_NORMAL, 13.5)?,
+                badge_icon: badge_icon_format,
             };
 
             let _ = formats.input.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
@@ -488,6 +652,7 @@ impl Renderer {
                     width: (rect.right - rect.left) as u32,
                     height: (rect.bottom - rect.top) as u32,
                 },
+                is_nerd_font,
             })
         }
     }
@@ -518,6 +683,7 @@ impl Renderer {
                 ..
             } = self;
             let ctx = context.as_mut().unwrap();
+            let is_nerd_font = ctx.is_nerd_font;
 
             let mut rect = RECT::default();
             let _ = GetClientRect(hwnd, &mut rect);
@@ -716,8 +882,9 @@ impl Renderer {
                         theme.badge_radius,
                         &ctx.brushes.accent_subtle,
                         &ctx.brushes.accent_border,
-                        BADGE_CFG.as_wide(),
+                        pick_glyph(&ICON_CFG, is_nerd_font),
                         &ctx.brushes.accent,
+                        is_nerd_font,
                     ),
                     ItemKind::Exit => draw_badge(
                         &target,
@@ -727,8 +894,9 @@ impl Renderer {
                         theme.badge_radius,
                         &ctx.brushes.badge_bg,
                         &ctx.brushes.border,
-                        BADGE_EXIT.as_wide(),
+                        pick_glyph(&ICON_EXIT, is_nerd_font),
                         &ctx.brushes.text,
+                        is_nerd_font,
                     ),
                     ItemKind::Calculator { .. } => draw_badge(
                         &target,
@@ -738,8 +906,9 @@ impl Renderer {
                         theme.badge_radius,
                         &ctx.brushes.accent_subtle,
                         &ctx.brushes.accent_border,
-                        BADGE_FX.as_wide(),
+                        pick_glyph(&ICON_FX, is_nerd_font),
                         &ctx.brushes.accent,
+                        is_nerd_font,
                     ),
                     ItemKind::Command { .. } => draw_badge(
                         &target,
@@ -749,8 +918,9 @@ impl Renderer {
                         theme.badge_radius,
                         &ctx.brushes.badge_bg,
                         &ctx.brushes.border,
-                        BADGE_CMD.as_wide(),
+                        pick_glyph(&ICON_CMD, is_nerd_font),
                         &ctx.brushes.admin_badge,
+                        is_nerd_font,
                     ),
                     ItemKind::Web => draw_badge(
                         &target,
@@ -760,8 +930,9 @@ impl Renderer {
                         theme.badge_radius,
                         &ctx.brushes.accent_subtle,
                         &ctx.brushes.accent_border,
-                        BADGE_WEB.as_wide(),
+                        pick_glyph(&ICON_WEB, is_nerd_font),
                         &ctx.brushes.accent,
+                        is_nerd_font,
                     ),
                     ItemKind::Path => draw_badge(
                         &target,
@@ -771,8 +942,9 @@ impl Renderer {
                         theme.badge_radius,
                         &ctx.brushes.badge_bg,
                         &ctx.brushes.border,
-                        BADGE_PATH.as_wide(),
+                        pick_glyph(&ICON_PATH, is_nerd_font),
                         &ctx.brushes.subtext,
+                        is_nerd_font,
                     ),
                     ItemKind::Application => {
                         let icon_bmp = icon_cache.get_or_load(&target, &item.path, icon_px);
@@ -793,8 +965,9 @@ impl Renderer {
                                 theme.badge_radius,
                                 &ctx.brushes.badge_bg,
                                 &ctx.brushes.border,
-                                BADGE_APP.as_wide(),
+                                pick_glyph(&ICON_APP, is_nerd_font),
                                 &ctx.brushes.subtext,
+                                is_nerd_font,
                             );
                         }
                     }

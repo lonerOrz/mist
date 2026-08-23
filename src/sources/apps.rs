@@ -128,14 +128,6 @@ fn read_reg_string(hkey: HKEY, subkey: PCWSTR, value_name: PCWSTR) -> Result<Str
 
 fn scan_env_path() -> Vec<Item> {
     let mut items = Vec::new();
-    let pathext = std::env::var("PATHEXT")
-        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD;.PS1".into())
-        .to_lowercase();
-    let valid_exts: HashSet<&str> = pathext
-        .split(';')
-        .map(|s| s.trim().trim_start_matches('.'))
-        .filter(|s| !s.is_empty())
-        .collect();
 
     for dir in get_true_windows_path() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -143,28 +135,19 @@ fn scan_env_path() -> Vec<Item> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_file() {
+            if !path.is_file() || !is_valid_executable(&path) {
                 continue;
             }
-            let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-                continue;
-            };
-            if !valid_exts.contains(ext.to_lowercase().as_str()) {
-                continue;
-            }
-            if ext.eq_ignore_ascii_case("exe") && is_cui_image(&path) {
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+                && is_cui_image(&path)
+            {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let name_lower = stem.to_lowercase();
-            let path_str = path.to_string_lossy().to_string();
-            let path_lower = path_str.to_lowercase();
-            if is_blacklisted(&name_lower, &path_lower) {
-                continue;
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                items.push(Item::new_application(stem, path.to_string_lossy().as_ref()));
             }
-            items.push(Item::new_application(stem, &path_str));
         }
     }
     items
@@ -195,16 +178,9 @@ fn scan_app_paths() -> Vec<Item> {
                             .and_then(|s| s.to_str())
                             .unwrap_or(&name)
                             .to_lowercase();
-                        let path_lower = exe.to_lowercase();
-                        if is_blacklisted(&stem, &path_lower)
-                            || (Path::new(&exe)
-                                .extension()
-                                .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
-                                && is_cui_image(Path::new(&exe)))
-                        {
-                            continue;
+                        if is_valid_executable(Path::new(&exe)) {
+                            items.push(Item::new_application(&stem, &exe));
                         }
-                        items.push(Item::new_application(&stem, &exe));
                     }
                 }
             }
@@ -251,34 +227,81 @@ fn enum_reg_keys(hkey: HKEY, subkey: &str) -> Option<Vec<String>> {
     }
 }
 
-fn is_blacklisted(name_lower: &str, path_lower: &str) -> bool {
-    const BLACKLIST: &[&str] = &[
-        "uninstall",
-        "unins000",
-        "unins001",
-        "vcredist",
-        "dxsetup",
-        "dotnetfx",
-        "installer",
-        "setup",
-        "updater",
-        "update.exe",
-        "elevate.exe",
-        "crashpad",
-        "crash_reporter",
-        "error_report",
-        "bugreport",
-        "helper.exe",
-        "daemon.exe",
-        "qtwebengineprocess",
-        "wow_helper",
-        "service.exe",
-        "redist",
-    ];
+/// 判断一个路径是否为真正的可执行程序（解析 .lnk 目标后检查扩展名）
+fn is_valid_executable(path: &Path) -> bool {
+    is_valid_executable_depth(path, 0)
+}
 
-    BLACKLIST
-        .iter()
-        .any(|&bad| name_lower.contains(bad) || path_lower.contains(bad))
+fn is_valid_executable_depth(path: &Path, depth: usize) -> bool {
+    if depth > 2 {
+        return false;
+    }
+    const VALID_EXTS: &[&str] = &["exe", "bat", "cmd", "msc", "cpl", "appref-ms"];
+
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let ext_lower = ext.to_lowercase();
+    if VALID_EXTS.contains(&ext_lower.as_str()) {
+        return true;
+    }
+    if ext_lower == "lnk"
+        && let Some(target) = resolve_lnk_target(path)
+    {
+        return is_valid_executable_depth(&target, depth + 1);
+    }
+    false
+}
+
+/// 读取 PE 文件子系统字段，3=CUI(控制台)，2=GUI(图形界面)
+fn is_cui_image(path: &Path) -> bool {
+    read_pe_subsystem(path) == Some(3)
+}
+
+fn read_pe_subsystem(path: &Path) -> Option<u16> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; 4096];
+    let n = std::io::Read::read(&mut file, &mut buf).ok()?;
+    if n < 0x40 || &buf[0..2] != b"MZ" {
+        return None;
+    }
+    let e_lfanew = u32::from_le_bytes(buf[0x3C..0x40].try_into().ok()?) as usize;
+    let pe = buf.get(e_lfanew..e_lfanew + 4)?;
+    if pe != b"PE\0\0" {
+        return None;
+    }
+    let off = e_lfanew + 24 + 68;
+    Some(u16::from_le_bytes(buf.get(off..off + 2)?.try_into().ok()?))
+}
+
+/// 标准 COM 接口解析 .lnk 快捷方式的真实目标
+fn resolve_lnk_target(lnk_path: &Path) -> Option<PathBuf> {
+    unsafe {
+        let wide = to_wide(&lnk_path.to_string_lossy());
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        let persist: IPersistFile = link.cast().ok()?;
+        persist.Load(PCWSTR(wide.as_ptr()), STGM_READ).ok()?;
+
+        let mut raw = [0u16; 1024];
+        link.GetPath(&mut raw, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32)
+            .ok()?;
+
+        let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+        let raw_str = String::from_utf16_lossy(&raw[..end]);
+        if raw_str.is_empty() {
+            return None;
+        }
+
+        let raw_w = to_wide(&raw_str);
+        let mut expanded = [0u16; 1024];
+        let n = ExpandEnvironmentStringsW(PCWSTR(raw_w.as_ptr()), Some(&mut expanded)) as usize;
+
+        let expanded = String::from_utf16_lossy(&expanded[..n.min(expanded.len())])
+            .trim_end_matches('\0')
+            .to_string();
+
+        (!expanded.is_empty()).then_some(PathBuf::from(expanded))
+    }
 }
 
 fn scan_start_menu_and_desktop() -> Vec<Item> {
@@ -307,30 +330,6 @@ fn known_folder_path(id: &GUID) -> Option<PathBuf> {
     }
 }
 
-fn is_cui_image(path: &Path) -> bool {
-    read_pe_subsystem(path) == Some(3)
-}
-
-fn read_pe_subsystem(path: &Path) -> Option<u16> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; 4096];
-    let n = std::io::Read::read(&mut file, &mut buf).ok()?;
-    pe_subsystem(&buf[..n])
-}
-
-fn pe_subsystem(buf: &[u8]) -> Option<u16> {
-    if buf.len() < 0x40 || &buf[0..2] != b"MZ" {
-        return None;
-    }
-    let e_lfanew = u32::from_le_bytes(buf[0x3C..0x40].try_into().ok()?) as usize;
-    let pe = buf.get(e_lfanew..e_lfanew + 4)?;
-    if pe != b"PE\0\0" {
-        return None;
-    }
-    let off = e_lfanew + 24 + 68;
-    Some(u16::from_le_bytes(buf.get(off..off + 2)?.try_into().ok()?))
-}
-
 fn walk_directory(dir: &Path, out: &mut Vec<Item>, depth: usize) {
     if depth > 6 {
         return;
@@ -343,26 +342,10 @@ fn walk_directory(dir: &Path, out: &mut Vec<Item>, depth: usize) {
         let path = entry.path();
         if path.is_dir() {
             walk_directory(&path, out, depth + 1);
-        } else if let Some(ext) = path.extension() {
-            let ext_str = ext.to_string_lossy().to_lowercase();
-            if (ext_str == "lnk"
-                || ext_str == "exe"
-                || ext_str == "url"
-                || ext_str == "appref-ms"
-                || ext_str == "bat"
-                || ext_str == "cmd")
-                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-            {
-                let name_lower = stem.to_lowercase();
-                let path_str = path.to_string_lossy().to_string();
-                let path_lower = path_str.to_lowercase();
-
-                if is_blacklisted(&name_lower, &path_lower) {
-                    continue;
-                }
-
-                out.push(Item::new_application(stem, &path_str));
-            }
+        } else if is_valid_executable(&path)
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        {
+            out.push(Item::new_application(stem, path.to_string_lossy().as_ref()));
         }
     }
 }
@@ -405,10 +388,9 @@ fn scan_uwp_apps() -> Vec<Item> {
                     let parsing_path = path_ptr.to_string().unwrap_or_default();
                     CoTaskMemFree(Some(path_ptr.0 as *const _));
 
-                    let name_lower = display_name.to_lowercase();
                     let path_lower = parsing_path.to_lowercase();
 
-                    if !parsing_path.is_empty() && !is_blacklisted(&name_lower, &path_lower) {
+                    if !parsing_path.is_empty() {
                         let aumid_path = if path_lower.starts_with("shell:appsfolder\\") {
                             parsing_path
                         } else {

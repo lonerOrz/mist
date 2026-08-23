@@ -5,6 +5,9 @@ edition = "2024"
 authors = ["lonerOrz"]
 description = "Fast, minimal Windows launcher"
 
+[lints.rust]
+linker_messages = "allow"
+
 [dependencies]
 evalexpr = "13.1"
 serde = { version = "1.0", features = ["derive"] }
@@ -28,6 +31,8 @@ features = [
     "Win32_Security",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
+    "Win32_System_Power",
+    "Win32_System_Shutdown",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_DataExchange",

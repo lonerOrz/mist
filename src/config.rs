@@ -4,7 +4,13 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 use std::thread;
 use std::time::Duration;
+
+use crate::domain::to_wide;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RegCloseKey, RegDeleteValueW, RegOpenKeyExW,
+    RegSetValueExW,
+};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +35,9 @@ pub struct Config {
 
     #[serde(default = "default_corner_radius")]
     pub corner_radius: f32,
+
+    #[serde(default = "default_autostart")]
+    pub autostart: bool,
 }
 
 fn default_hotkey() -> String {
@@ -52,6 +61,9 @@ fn default_opacity() -> f32 {
 fn default_corner_radius() -> f32 {
     8.0
 }
+fn default_autostart() -> bool {
+    false
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -63,6 +75,7 @@ impl Default for Config {
             width: default_width(),
             opacity: default_opacity(),
             corner_radius: default_corner_radius(),
+            autostart: default_autostart(),
         }
     }
 }
@@ -89,6 +102,31 @@ pub fn get_config_path() -> PathBuf {
     get_mist_dir().join("config.toml")
 }
 
+pub fn sync_autostart(enable: bool) {
+    unsafe {
+        let Ok(current_exe) = std::env::current_exe() else {
+            return;
+        };
+        let formatted_path = format!("\"{}\"", current_exe.to_string_lossy());
+        let wide_val = to_wide(&formatted_path);
+
+        let subkey = windows::core::w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
+        let app_name = windows::core::w!("Mist");
+
+        let mut hkey = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, subkey, Some(0), KEY_SET_VALUE, &mut hkey).is_ok() {
+            if enable {
+                let bytes =
+                    std::slice::from_raw_parts(wide_val.as_ptr().cast::<u8>(), wide_val.len() * 2);
+                let _ = RegSetValueExW(hkey, app_name, None, REG_SZ, Some(bytes));
+            } else {
+                let _ = RegDeleteValueW(hkey, app_name);
+            }
+            let _ = RegCloseKey(hkey);
+        }
+    }
+}
+
 const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Mist Launcher Configuration
 
 # Shortcut hotkey to toggle the launcher window (e.g. "Ctrl+Space", "Alt+Space", "Win+Space")
@@ -111,6 +149,9 @@ opacity = 0.72
 
 # Corner radius in pixels (0.0 - 20.0, inner elements scale with it)
 corner_radius = 8.0
+
+# Launch Mist automatically at login (managed via HKCU\...\Run)
+autostart = false
 "#;
 
 impl Config {

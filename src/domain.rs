@@ -5,6 +5,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::System::DataExchange::*;
 use windows::Win32::System::Memory::*;
 use windows::Win32::System::Ole::*;
+use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, PostQuitMessage, SW_SHOWNORMAL,
@@ -25,6 +26,10 @@ pub enum Action {
         path: Arc<str>,
         verb: Option<&'static str>,
     },
+    LockScreen,
+    SleepSystem,
+    ShutdownSystem,
+    RestartSystem,
     CopyText(Arc<str>),
     ExitApp,
 }
@@ -43,6 +48,22 @@ impl Action {
             Action::ExitApp => unsafe {
                 PostQuitMessage(0);
             },
+            Action::LockScreen => unsafe {
+                let _ = LockWorkStation();
+            },
+            Action::SleepSystem => unsafe {
+                let _ = windows::Win32::System::Power::SetSuspendState(false, true, false);
+            },
+            Action::ShutdownSystem => {
+                let _ = std::process::Command::new("shutdown.exe")
+                    .args(["/s", "/t", "0"])
+                    .spawn();
+            }
+            Action::RestartSystem => {
+                let _ = std::process::Command::new("shutdown.exe")
+                    .args(["/r", "/t", "0"])
+                    .spawn();
+            }
             Action::Launch { path, verb } => {
                 let path_str = &**path;
 

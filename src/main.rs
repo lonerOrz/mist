@@ -120,6 +120,7 @@ fn main() -> Result<()> {
     }
 
     let config = Config::load_or_create();
+    crate::config::sync_autostart(config.autostart);
 
     let args: Vec<String> = std::env::args().collect();
     let force_show = args
@@ -318,6 +319,7 @@ unsafe extern "system" fn wnd_proc(
         WM_CONFIG_RELOADED => {
             if lparam.0 != 0 {
                 let boxed = unsafe { Box::from_raw(lparam.0 as *mut Config) };
+                crate::config::sync_autostart(boxed.autostart);
                 apply_corner(hwnd, boxed.corner_radius);
                 apply_hotkeys(hwnd, &boxed.hotkey);
                 if let Some(app) = app_opt {

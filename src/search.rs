@@ -126,6 +126,9 @@ mod tests {
 
         assert_eq!(match_item(&wx, "wx", "wx", 50).unwrap().score, 1850);
 
+        let chrome = Item::new_application("Google Chrome", r"C:\chrome.exe");
+        assert!(match_item(&chrome, "c", "c", 400).unwrap().score < 1800);
+
         assert!(match_item(&wx, "qq", "qq", 0).is_none());
     }
 
@@ -150,18 +153,5 @@ mod tests {
 
         let uwp = Item::new_application("Photos", r"shell:AppsFolder\abc.def");
         assert_eq!(uwp.keys.len(), 1);
-    }
-
-    #[test]
-    fn test_ranking_and_saturation() {
-        let vsc = Item::new_application("Visual Studio Code", r"C:\code.exe");
-        let chrome = Item::new_application("Google Chrome", r"C:\chrome.exe");
-        let wx = Item::new_application("\u{5fae}\u{4fe1}", r"C:\wx.exe");
-
-        assert!(match_item(&vsc, "vsc", "vsc", 0).unwrap().score >= 1100);
-        let code = match_item(&vsc, "code", "code", 0).unwrap().score;
-        assert!(code >= 800);
-        assert_eq!(match_item(&wx, "wx", "wx", 0).unwrap().score, 1800);
-        assert!(match_item(&chrome, "c", "c", 400).unwrap().score < 1800);
     }
 }

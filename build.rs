@@ -2,58 +2,83 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
 use unicode_normalization::UnicodeNormalization;
 
 const RANGE_LO: u32 = 0x4E00;
 const RANGE_HI: u32 = 0x9FA5;
-const DICT_URL: &str = "https://raw.githubusercontent.com/mozillazg/pinyin-data/v0.15.0/pinyin.txt";
-
-fn dict_path() -> PathBuf {
-    env::temp_dir().join("mist-pinyin.txt")
-}
-
-fn ensure_dict(cache: &Path) {
-    if cache.exists() {
-        return;
-    }
-    let _ = Command::new("curl")
-        .args(["-fL", DICT_URL, "-o"])
-        .arg(cache)
-        .status();
-}
+const PINYIN_URL: &str =
+    "https://raw.githubusercontent.com/mozillazg/pinyin-data/master/pinyin.txt";
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=MIST_PINYIN_DICT");
     println!("cargo:rerun-if-changed=build.rs");
 
-    let out_dir = env::var("OUT_DIR").unwrap();
-    let cache = dict_path();
-    ensure_dict(&cache);
-    let dict: &Path = &cache;
-    if !dict.exists() {
-        println!(
-            "cargo:warning=pinyin dictionary unavailable (offline?): Chinese search disabled until {} can be fetched",
-            cache.display()
-        );
-        fs::write(
-            Path::new(&out_dir).join("pinyin_data.rs"),
-            "static SYLLABLES: &[&str] = &[\"\"];\n",
-        )
-        .unwrap();
-        fs::write(Path::new(&out_dir).join("pinyin_map.bin"), [0u8; 2]).unwrap();
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+
+    if let Ok(env_path) = env::var("MIST_PINYIN_DICT") {
+        let path = Path::new(&env_path);
+        if path.is_file() && process_dictionary(path, &out_dir) {
+            return;
+        }
+    }
+
+    let tmp_dict = env::temp_dir().join("mist_pinyin_data.txt");
+
+    if !is_valid_file(&tmp_dict) {
+        let _ = fetch_file(PINYIN_URL, &tmp_dict);
+    }
+
+    if tmp_dict.is_file() && process_dictionary(&tmp_dict, &out_dir) {
         return;
     }
+
+    write_stub_files(&out_dir);
+}
+
+fn is_valid_file(path: &Path) -> bool {
+    path.is_file() && fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+}
+
+fn fetch_file(url: &str, dest: &Path) -> bool {
+    let dest_str = dest.to_string_lossy();
+
+    let curl_ok = Command::new("curl")
+        .args(["-fsSL", url, "-o", &dest_str])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if curl_ok && is_valid_file(dest) {
+        return true;
+    }
+
+    if cfg!(windows) {
+        let ps_cmd = format!("Invoke-WebRequest -Uri '{url}' -OutFile '{dest_str}'");
+        let ps_ok = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &ps_cmd])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if ps_ok && is_valid_file(dest) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn process_dictionary(dict_path: &Path, out_dir: &Path) -> bool {
+    let Ok(file) = fs::File::open(dict_path) else {
+        return false;
+    };
 
     let mut readings: BTreeMap<u32, String> = BTreeMap::new();
     let mut syllables: BTreeSet<String> = BTreeSet::new();
 
-    for line in BufReader::new(fs::File::open(dict).unwrap())
-        .lines()
-        .map_while(Result::ok)
-    {
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
         let line = line.trim();
         if line.starts_with('#') || !line.contains(':') {
             continue;
@@ -74,16 +99,20 @@ fn main() {
         let first = rest
             .split('#')
             .next()
-            .unwrap()
+            .unwrap_or("")
             .split(',')
             .next()
-            .unwrap()
+            .unwrap_or("")
             .trim();
         let plain = strip_tones(first);
         if !plain.is_empty() {
             readings.insert(code, plain.clone());
             syllables.insert(plain);
         }
+    }
+
+    if readings.is_empty() {
+        return false;
     }
 
     let table: Vec<String> = std::iter::once(String::new()).chain(syllables).collect();
@@ -97,11 +126,16 @@ fn main() {
     let mut bin = vec![0u8; count * 2];
     for (code, py) in &readings {
         let idx = ((code - RANGE_LO) as usize) * 2;
-        let id = id_of[py.as_str()].to_le_bytes();
-        bin[idx] = id[0];
-        bin[idx + 1] = id[1];
+        if let Some(&id) = id_of.get(py.as_str()) {
+            let bytes = id.to_le_bytes();
+            bin[idx] = bytes[0];
+            bin[idx + 1] = bytes[1];
+        }
     }
-    fs::write(Path::new(&out_dir).join("pinyin_map.bin"), &bin).unwrap();
+
+    if fs::write(out_dir.join("pinyin_map.bin"), &bin).is_err() {
+        return false;
+    }
 
     let mut rs = String::from("static SYLLABLES: &[&str] = &[\n");
     for chunk in table.chunks(10) {
@@ -116,9 +150,22 @@ fn main() {
         rs.push_str(",\n");
     }
     rs.push_str("];\n");
-    fs::write(Path::new(&out_dir).join("pinyin_data.rs"), rs).unwrap();
+
+    fs::write(out_dir.join("pinyin_data.rs"), rs).is_ok()
 }
 
 fn strip_tones(s: &str) -> String {
     s.nfd().filter(|c| c.is_ascii_alphabetic()).collect()
+}
+
+fn write_stub_files(out_dir: &Path) {
+    println!(
+        "cargo:warning=Pinyin dictionary unavailable (offline/no env); built with pinyin search disabled."
+    );
+
+    let _ = fs::write(
+        out_dir.join("pinyin_data.rs"),
+        "static SYLLABLES: &[&str] = &[\"\"];\n",
+    );
+    let _ = fs::write(out_dir.join("pinyin_map.bin"), [0u8; 2]);
 }
