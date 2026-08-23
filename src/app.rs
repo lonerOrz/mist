@@ -1,15 +1,17 @@
-use crate::calc;
+use crate::config::Config;
 use crate::domain::Item;
 use crate::history::History;
-use crate::renderer::{Renderer, Spring, metrics};
-use crate::search;
+use crate::query::QueryPipeline;
+use crate::renderer::{Renderer, Spring, Theme, metrics, window_scale};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const TIMER_ANIMATION: usize = 2;
 
 pub struct App {
+    pub config: Config,
     pub index: Vec<Item>,
     pub query: String,
     pub results: Vec<Item>,
@@ -24,8 +26,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(renderer: Renderer) -> Self {
+    pub fn new(renderer: Renderer, config: Config) -> Self {
+        let mut renderer = renderer;
+        renderer.set_theme(Theme::from_config(&config));
         Self {
+            config,
             index: Vec::new(),
             query: String::new(),
             results: Vec::new(),
@@ -40,45 +45,42 @@ impl App {
         }
     }
 
-    pub fn set_index(&mut self, items: Vec<Item>) {
+    pub fn set_index(&mut self, mut items: Vec<Item>) {
+        items.extend(crate::sources::system::builtins());
         self.index = items;
     }
 
+    pub fn update_config(&mut self, hwnd: HWND, new_config: Config) {
+        if self.config.font_family != new_config.font_family {
+            self.renderer
+                .set_font_family(new_config.font_family.clone());
+        }
+        self.renderer.set_theme(Theme::from_config(&new_config));
+        self.config = new_config;
+        self.on_query_change(hwnd);
+        unsafe {
+            if IsWindowVisible(hwnd).as_bool() {
+                let s = window_scale(hwnd);
+                let h = self.height_spring.current.round() as i32;
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    (self.config.width as f32 * s).round() as i32,
+                    (h as f32 * s).round() as i32,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+                );
+            }
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
     pub fn on_query_change(&mut self, hwnd: HWND) {
-        let q = self.query.trim();
         self.selected = 0;
         self.hovered = None;
-        self.results.clear();
 
-        if !q.is_empty() {
-            let calc_item = calc::eval(q);
-            if let Some(c) = &calc_item {
-                self.results.push(c.clone());
-            }
-
-            let q_lower = q.to_lowercase();
-            let mut scored: Vec<(usize, i32)> = Vec::new();
-            let mut has_exact_app = false;
-            for (idx, item) in self.index.iter().enumerate() {
-                let f_score = self.history.get_score(&item.path);
-                if let Some(m) = search::match_item(item, q, &q_lower, f_score) {
-                    if item.name_lower.as_ref() == q_lower {
-                        has_exact_app = true;
-                    }
-                    scored.push((idx, m.score));
-                }
-            }
-            scored.sort_by_key(|a| std::cmp::Reverse(a.1));
-            scored.truncate(8);
-            for (idx, _) in scored {
-                self.results.push(self.index[idx].clone());
-            }
-
-            if !has_exact_app && calc_item.is_none() {
-                self.results.push(Item::new_command(q));
-            }
-        }
-
+        self.results = QueryPipeline::query(&self.query, &self.index, &self.history, &self.config);
         self.pill.reset(metrics::LIST_TOP);
         self.update_window_geometry(hwnd);
     }
@@ -103,7 +105,7 @@ impl App {
         if self.results.is_empty() || y < metrics::LIST_TOP {
             if self.hovered.take().is_some() {
                 unsafe {
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             return;
@@ -116,6 +118,10 @@ impl App {
             self.pill.set_target(list_item_top(idx));
             if changed {
                 self.trigger_animation(hwnd);
+            }
+        } else if self.hovered.take().is_some() {
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
         }
     }
@@ -131,10 +137,21 @@ impl App {
 
             let item = &self.results[idx];
             let is_calc = matches!(item.kind, crate::domain::ItemKind::Calculator { .. });
-            let admin_min_x = (metrics::WINDOW_WIDTH - 176) as f32;
-            let admin_max_x = (metrics::WINDOW_WIDTH - 82) as f32;
+            let is_cfg = matches!(item.kind, crate::domain::ItemKind::Config);
+            let is_exit = matches!(item.kind, crate::domain::ItemKind::Exit);
+            let admin_min_x = (self.config.width - metrics::ADMIN_ZONE_FAR) as f32;
+            let admin_max_x = (self.config.width - metrics::ADMIN_ZONE_NEAR) as f32;
 
-            if !is_calc && x >= admin_min_x && x <= admin_max_x {
+            let row_top = list_item_top(idx);
+            let in_admin_button = y >= row_top + 13.5 && y <= row_top + 36.5;
+
+            if !is_calc
+                && !is_cfg
+                && !is_exit
+                && in_admin_button
+                && x >= admin_min_x
+                && x <= admin_max_x
+            {
                 self.execute_selected_admin(hwnd);
             } else {
                 self.execute_selected(hwnd);
@@ -172,16 +189,19 @@ impl App {
         self.spring_animating = false;
 
         unsafe {
+            let s = window_scale(hwnd);
             let _ = SetWindowPos(
                 hwnd,
-                HWND_TOPMOST,
+                Some(HWND_TOPMOST),
                 0,
                 0,
-                metrics::WINDOW_WIDTH,
-                metrics::HEADER_HEIGHT,
+                (self.config.width as f32 * s).round() as i32,
+                (metrics::HEADER_HEIGHT as f32 * s).round() as i32,
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
             );
             let _ = ShowWindow(hwnd, SW_HIDE);
+
+            let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
         }
     }
 
@@ -192,14 +212,15 @@ impl App {
 
         if height_moving {
             let h = self.height_spring.current.round() as i32;
+            let s = window_scale(hwnd);
             unsafe {
                 let _ = SetWindowPos(
                     hwnd,
-                    HWND_TOPMOST,
+                    Some(HWND_TOPMOST),
                     0,
                     0,
-                    metrics::WINDOW_WIDTH,
-                    h,
+                    (self.config.width as f32 * s).round() as i32,
+                    (h as f32 * s).round() as i32,
                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
                 );
             }
@@ -215,6 +236,7 @@ impl App {
             let _ = self.renderer.render(
                 hwnd,
                 &self.query,
+                &self.config.placeholder,
                 &items,
                 self.selected,
                 self.caret_visible,
@@ -227,8 +249,8 @@ impl App {
     pub fn trigger_animation(&mut self, hwnd: HWND) {
         self.spring_animating = true;
         unsafe {
-            let _ = SetTimer(hwnd, TIMER_ANIMATION, 16, None);
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = SetTimer(Some(hwnd), TIMER_ANIMATION, 16, None);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
     }
 
