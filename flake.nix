@@ -3,6 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -17,12 +18,13 @@
     }:
     let
       system = "x86_64-linux";
+
       pkgs = import nixpkgs {
         inherit system;
-        overlays = [ (import rust-overlay) ];
+        overlays = [
+          (import rust-overlay)
+        ];
       };
-
-      mingwPkgs = pkgs.pkgsCross.mingwW64;
 
       rustToolchain = pkgs.rust-bin.nightly.latest.default.override {
         extensions = [
@@ -30,23 +32,25 @@
           "rust-analyzer"
           "clippy"
         ];
-        targets = [ "x86_64-pc-windows-gnu" ];
+
+        targets = [
+          "x86_64-pc-windows-gnu"
+        ];
       };
+
     in
     {
       devShells.${system}.default = pkgs.mkShell {
-        nativeBuildInputs = [
+        packages = [
           rustToolchain
-          mingwPkgs.stdenv.cc
-          pkgs.pkg-config
+          pkgs.zig
+          pkgs.cargo-zigbuild
         ];
 
-        buildInputs = [
-          mingwPkgs.windows.pthreads
-        ];
-
-        CARGO_BUILD_TARGET = "x86_64-pc-windows-gnu";
-        CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${mingwPkgs.stdenv.cc}/bin/x86_64-w64-mingw32-gcc";
+        shellHook = ''
+          echo "Rust + Zig Windows cross compile environment"
+          echo "Build: cargo zigbuild --target x86_64-pc-windows-gnu"
+        '';
       };
     };
 }
