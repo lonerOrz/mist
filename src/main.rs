@@ -329,9 +329,7 @@ unsafe extern "system" fn wnd_proc(
                     app.set_index(*boxed);
                     app.on_query_change(hwnd);
                 }
-                unsafe {
-                    let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
-                }
+                // keep hot pages in memory to avoid first-key page faults
             }
             LRESULT(0)
         }

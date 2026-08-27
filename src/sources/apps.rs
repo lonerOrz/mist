@@ -19,22 +19,21 @@ fn scoped_com<T>(f: impl FnOnce() -> T) -> T {
 }
 
 pub fn scan_all() -> Vec<Item> {
-    let (startmenu, uwp, path_apps, app_paths) = std::thread::scope(|s| {
+    let (startmenu, uwp, app_paths) = std::thread::scope(|s| {
         let b = s.spawn(|| scoped_com(scan_start_menu_and_desktop));
         let c = s.spawn(|| scoped_com(scan_uwp_apps));
-        let d = s.spawn(scan_env_path);
-        let e = s.spawn(scan_app_paths);
+        let d = s.spawn(scan_app_paths);
         (
             b.join().unwrap_or_default(),
             c.join().unwrap_or_default(),
             d.join().unwrap_or_default(),
-            e.join().unwrap_or_default(),
         )
     });
 
-    let mut items = Vec::new();
+    let mut items = Vec::with_capacity(startmenu.len() + uwp.len() + app_paths.len());
     let mut seen_keys: HashSet<Box<str>> = HashSet::new();
-    for source in [startmenu, uwp, path_apps, app_paths] {
+
+    for source in [startmenu, uwp, app_paths] {
         for item in source {
             if seen_keys.insert(item.name.to_lowercase().into_boxed_str()) {
                 items.push(item);
@@ -42,49 +41,6 @@ pub fn scan_all() -> Vec<Item> {
         }
     }
     items
-}
-
-fn get_true_windows_path() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut seen = HashSet::new();
-    let mut add_dir = |d: PathBuf| {
-        if d.is_dir() && seen.insert(d.clone()) {
-            dirs.push(d);
-        }
-    };
-
-    if let Ok(s) = read_reg_string(
-        HKEY_LOCAL_MACHINE,
-        w!(r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
-        w!("Path"),
-    ) {
-        for p in s.split(';') {
-            let p = expand_env(p.trim());
-            if !p.is_empty() {
-                add_dir(PathBuf::from(p));
-            }
-        }
-    }
-    if let Ok(s) = read_reg_string(HKEY_CURRENT_USER, w!(r"Environment"), w!("Path")) {
-        for p in s.split(';') {
-            let p = expand_env(p.trim());
-            if !p.is_empty() {
-                add_dir(PathBuf::from(p));
-            }
-        }
-    }
-    if let Ok(s) = std::env::var("PATH") {
-        for p in s.split(';') {
-            let p = expand_env(p.trim());
-            if !p.is_empty() {
-                add_dir(PathBuf::from(p));
-            }
-        }
-    }
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        add_dir(PathBuf::from(local).join(r"Microsoft\WindowsApps"));
-    }
-    dirs
 }
 
 fn expand_env(s: &str) -> String {
@@ -126,33 +82,6 @@ fn read_reg_string(hkey: HKEY, subkey: PCWSTR, value_name: PCWSTR) -> Result<Str
     }
 }
 
-fn scan_env_path() -> Vec<Item> {
-    let mut items = Vec::new();
-
-    for dir in get_true_windows_path() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() || !is_valid_executable(&path) {
-                continue;
-            }
-            if path
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
-                && is_cui_image(&path)
-            {
-                continue;
-            }
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                items.push(Item::new_application(stem, path.to_string_lossy().as_ref()));
-            }
-        }
-    }
-    items
-}
-
 fn scan_app_paths() -> Vec<Item> {
     let mut items = Vec::new();
     for hkey in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
@@ -170,7 +99,8 @@ fn scan_app_paths() -> Vec<Item> {
                     let val_path = format!(r"{subkey}\{name}");
                     let val_w = to_wide(&val_path);
                     if let Ok(exe) = read_reg_string(hkey, PCWSTR(val_w.as_ptr()), w!("")) {
-                        if exe.is_empty() {
+                        let expanded_exe = expand_env(&exe);
+                        if expanded_exe.is_empty() {
                             continue;
                         }
                         let stem = Path::new(&name)
@@ -178,8 +108,8 @@ fn scan_app_paths() -> Vec<Item> {
                             .and_then(|s| s.to_str())
                             .unwrap_or(&name)
                             .to_lowercase();
-                        if is_valid_executable(Path::new(&exe)) {
-                            items.push(Item::new_application(&stem, &exe));
+                        if is_valid_executable(Path::new(&expanded_exe)) {
+                            items.push(Item::new_application(&stem, &expanded_exe));
                         }
                     }
                 }
@@ -227,81 +157,14 @@ fn enum_reg_keys(hkey: HKEY, subkey: &str) -> Option<Vec<String>> {
     }
 }
 
-/// 判断一个路径是否为真正的可执行程序（解析 .lnk 目标后检查扩展名）
+/// Lightweight extension check — no disk I/O or COM resolution
 fn is_valid_executable(path: &Path) -> bool {
-    is_valid_executable_depth(path, 0)
-}
-
-fn is_valid_executable_depth(path: &Path, depth: usize) -> bool {
-    if depth > 2 {
-        return false;
-    }
-    const VALID_EXTS: &[&str] = &["exe", "bat", "cmd", "msc", "cpl", "appref-ms"];
+    const VALID_EXTS: &[&str] = &["lnk", "exe", "bat", "cmd", "msc", "cpl", "appref-ms", "url"];
 
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
     };
-    let ext_lower = ext.to_lowercase();
-    if VALID_EXTS.contains(&ext_lower.as_str()) {
-        return true;
-    }
-    if ext_lower == "lnk"
-        && let Some(target) = resolve_lnk_target(path)
-    {
-        return is_valid_executable_depth(&target, depth + 1);
-    }
-    false
-}
-
-/// 读取 PE 文件子系统字段，3=CUI(控制台)，2=GUI(图形界面)
-fn is_cui_image(path: &Path) -> bool {
-    read_pe_subsystem(path) == Some(3)
-}
-
-fn read_pe_subsystem(path: &Path) -> Option<u16> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; 4096];
-    let n = std::io::Read::read(&mut file, &mut buf).ok()?;
-    if n < 0x40 || &buf[0..2] != b"MZ" {
-        return None;
-    }
-    let e_lfanew = u32::from_le_bytes(buf[0x3C..0x40].try_into().ok()?) as usize;
-    let pe = buf.get(e_lfanew..e_lfanew + 4)?;
-    if pe != b"PE\0\0" {
-        return None;
-    }
-    let off = e_lfanew + 24 + 68;
-    Some(u16::from_le_bytes(buf.get(off..off + 2)?.try_into().ok()?))
-}
-
-/// 标准 COM 接口解析 .lnk 快捷方式的真实目标
-fn resolve_lnk_target(lnk_path: &Path) -> Option<PathBuf> {
-    unsafe {
-        let wide = to_wide(&lnk_path.to_string_lossy());
-        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
-        let persist: IPersistFile = link.cast().ok()?;
-        persist.Load(PCWSTR(wide.as_ptr()), STGM_READ).ok()?;
-
-        let mut raw = [0u16; 1024];
-        link.GetPath(&mut raw, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32)
-            .ok()?;
-
-        let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
-        let raw_str = String::from_utf16_lossy(&raw[..end]);
-        if raw_str.is_empty() {
-            return None;
-        }
-
-        let raw_w = to_wide(&raw_str);
-        let mut expanded = [0u16; 1024];
-        let n = ExpandEnvironmentStringsW(PCWSTR(raw_w.as_ptr()), Some(&mut expanded)) as usize;
-
-        let expanded = String::from_utf16_lossy(&expanded[..n.min(expanded.len())])
-            .trim_end_matches('\0')
-            .to_string();
-
-        (!expanded.is_empty()).then_some(PathBuf::from(expanded))
-    }
+    VALID_EXTS.iter().any(|&v| v.eq_ignore_ascii_case(ext))
 }
 
 fn scan_start_menu_and_desktop() -> Vec<Item> {
