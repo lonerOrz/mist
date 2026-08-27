@@ -21,8 +21,9 @@
 
       pkgs = import nixpkgs {
         inherit system;
+
         overlays = [
-          (import rust-overlay)
+          rust-overlay.overlays.default
         ];
       };
 
@@ -41,16 +42,13 @@
     in
     {
       devShells.${system}.default = pkgs.mkShell {
-        packages = [
-          rustToolchain
-          pkgs.zig
-          pkgs.cargo-zigbuild
-        ];
 
-        shellHook = ''
-          echo "Rust + Zig Windows cross compile environment"
-          echo "Build: cargo zigbuild --target x86_64-pc-windows-gnu"
-        '';
+        packages = with pkgs; [
+          rustToolchain
+          zig
+          cargo-zigbuild
+          pkgsCross.mingwW64.stdenv.cc
+        ];
       };
     };
 }

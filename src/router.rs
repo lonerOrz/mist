@@ -50,10 +50,10 @@ fn match_prefix<'a>(q: &'a str, prefix: &str) -> Option<&'a str> {
     if q == prefix {
         return Some("");
     }
-    if let Some(rest) = q.strip_prefix(prefix) {
-        if rest.starts_with(' ') {
-            return Some(rest.trim());
-        }
+    if let Some(rest) = q.strip_prefix(prefix)
+        && rest.starts_with(' ')
+    {
+        return Some(rest.trim());
     }
     None
 }

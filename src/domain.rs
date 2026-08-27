@@ -271,8 +271,7 @@ impl Item {
             // Generate Cartesian product of all pronunciation combinations,
             // capped at MAX_COMBINATIONS to avoid explosion on long names.
             const MAX_COMBINATIONS: usize = 16;
-            let mut combinations: Vec<(String, String)> =
-                vec![(String::new(), String::new())];
+            let mut combinations: Vec<(String, String)> = vec![(String::new(), String::new())];
 
             for options in char_options {
                 let mut next = Vec::new();
@@ -292,14 +291,10 @@ impl Item {
             }
 
             for (full, initials) in combinations {
-                if !full.is_empty()
-                    && !keys.iter().any(|(_, k)| k.as_ref() == full)
-                {
+                if !full.is_empty() && !keys.iter().any(|(_, k)| k.as_ref() == full) {
                     keys.push((KeyKind::Pinyin, Arc::from(full)));
                 }
-                if !initials.is_empty()
-                    && !keys.iter().any(|(_, k)| k.as_ref() == initials)
-                {
+                if !initials.is_empty() && !keys.iter().any(|(_, k)| k.as_ref() == initials) {
                     keys.push((KeyKind::Initials, Arc::from(initials)));
                 }
             }

@@ -117,14 +117,32 @@ mod tests {
     #[test]
     fn test_bang_routing() {
         // Valid bangs
-        assert!(query("!gh rust").first().unwrap().path.contains("github.com"));
-        assert!(query("!b honkai").first().unwrap().path.contains("bilibili.com"));
+        assert!(
+            query("!gh rust")
+                .first()
+                .unwrap()
+                .path
+                .contains("github.com")
+        );
+        assert!(
+            query("!b honkai")
+                .first()
+                .unwrap()
+                .path
+                .contains("bilibili.com")
+        );
         assert!(query("!g").first().unwrap().path.contains("google.com"));
 
         // Invalid bangs (missing space)
         assert!(query("!ghrust").is_empty());
 
         // Direct URL
-        assert!(query("https://rust-lang.org").first().unwrap().path.contains("rust-lang.org"));
+        assert!(
+            query("https://rust-lang.org")
+                .first()
+                .unwrap()
+                .path
+                .contains("rust-lang.org")
+        );
     }
 }

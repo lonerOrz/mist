@@ -33,10 +33,10 @@ pub fn scan_all() -> Vec<Item> {
     });
 
     let mut items = Vec::new();
-    let mut seen_keys: HashSet<String> = HashSet::new();
+    let mut seen_keys: HashSet<Box<str>> = HashSet::new();
     for source in [startmenu, uwp, path_apps, app_paths] {
         for item in source {
-            if seen_keys.insert(item.name.to_lowercase()) {
+            if seen_keys.insert(item.name.to_lowercase().into_boxed_str()) {
                 items.push(item);
             }
         }
