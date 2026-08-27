@@ -86,6 +86,7 @@ impl Default for Config {
 impl Config {
     fn normalized(mut self) -> Self {
         self.width = self.width.clamp(400, 2000);
+        self.max_results = self.max_results.clamp(1, 50);
         self.opacity = self.opacity.clamp(0.05, 1.0);
         self.corner_radius = self.corner_radius.clamp(0.0, 20.0);
         self

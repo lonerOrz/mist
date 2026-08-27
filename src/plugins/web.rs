@@ -1,5 +1,19 @@
 use crate::domain::{Action, Item, ItemKind};
+use crate::plugins::{Plugin, PluginContext};
 use std::sync::Arc;
+
+pub struct WebPlugin;
+
+impl Plugin for WebPlugin {
+    fn can_handle(&self, raw_input: &str) -> bool {
+        raw_input.starts_with('!')
+            || raw_input.starts_with("http://")
+            || raw_input.starts_with("https://")
+    }
+    fn query(&self, raw_input: &str, _ctx: &PluginContext) -> Vec<Item> {
+        query(raw_input)
+    }
+}
 
 struct SearchEngine {
     prefix: &'static str,

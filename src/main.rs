@@ -684,6 +684,10 @@ unsafe fn toggle_window(hwnd: HWND) {
                 app.height_spring.reset(metrics::HEADER_HEIGHT as f32);
                 app.pill.reset(metrics::LIST_TOP);
 
+                let blink = GetCaretBlinkTime();
+                let blink = if blink == 0 { 500 } else { blink };
+                let _ = SetTimer(Some(hwnd), TIMER_CARET, blink, None);
+
                 let s = window_scale(hwnd);
                 let _ = SetWindowPos(
                     hwnd,

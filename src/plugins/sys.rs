@@ -1,38 +1,46 @@
-use crate::domain::{Action, Item};
+use super::{Plugin, PluginContext, filter_static_items, match_prefix};
+use crate::domain::Item;
+
+pub struct SysPlugin;
+
+impl Plugin for SysPlugin {
+    fn can_handle(&self, raw_input: &str) -> bool {
+        match_prefix(raw_input, "/sys").is_some()
+    }
+    fn query(&self, raw_input: &str, _ctx: &PluginContext) -> Vec<Item> {
+        match_prefix(raw_input, "/sys")
+            .map(query)
+            .unwrap_or_default()
+    }
+}
 
 pub fn query(args: &str) -> Vec<Item> {
     let items = vec![
         Item::new_system(
             "Lock Screen",
             "lock",
-            Action::LockScreen,
+            crate::domain::Action::LockScreen,
             &["lock screen", "suoping", "sp"],
         ),
         Item::new_system(
             "Shut Down",
             "shutdown",
-            Action::ShutdownSystem,
+            crate::domain::Action::ShutdownSystem,
             &["guanji", "gj"],
         ),
         Item::new_system(
             "Restart",
             "restart",
-            Action::RestartSystem,
+            crate::domain::Action::RestartSystem,
             &["reboot", "chongqi", "cq"],
         ),
-        Item::new_system("Sleep", "sleep", Action::SleepSystem, &["xiumian", "xm"]),
+        Item::new_system(
+            "Sleep",
+            "sleep",
+            crate::domain::Action::SleepSystem,
+            &["xiumian", "xm"],
+        ),
     ];
 
-    if args.is_empty() {
-        return items;
-    }
-
-    let args_lower = args.to_lowercase();
-    items
-        .into_iter()
-        .filter(|i| {
-            i.keys.iter().any(|(_, k)| k.to_lowercase() == args_lower)
-                || i.name.to_lowercase().contains(&args_lower)
-        })
-        .collect()
+    filter_static_items(items, args)
 }

@@ -1,8 +1,25 @@
 use crate::config::Config;
 use crate::domain::Item;
 use crate::history::History;
-use crate::plugins;
+use crate::plugins::{self, Plugin};
 use crate::search;
+use std::cmp::Ordering;
+use std::sync::OnceLock;
+
+static PLUGINS: OnceLock<Vec<Box<dyn Plugin>>> = OnceLock::new();
+
+fn get_plugins() -> &'static [Box<dyn Plugin>] {
+    PLUGINS.get_or_init(|| {
+        vec![
+            Box::new(plugins::cmd::CmdPlugin),
+            Box::new(plugins::calc::CalcPlugin),
+            Box::new(plugins::sys::SysPlugin),
+            Box::new(plugins::app_mgmt::AppMgmtPlugin),
+            Box::new(plugins::web::WebPlugin),
+            Box::new(plugins::path::PathPlugin),
+        ]
+    })
+}
 
 pub fn route_query(
     raw_query: &str,
@@ -15,67 +32,59 @@ pub fn route_query(
         return Vec::new();
     }
 
-    // 1. Explicit prefix routing
-    if let Some(rest) = match_prefix(q, ">") {
-        return plugins::cmd::query(rest);
+    let ctx = plugins::PluginContext {
+        index,
+        history,
+        config,
+    };
+
+    for plugin in get_plugins() {
+        if plugin.can_handle(q) {
+            return plugin.query(q, &ctx);
+        }
     }
 
-    // Calculator: allow ?1+1 or ? 1+1
-    if let Some(rest) = q.strip_prefix('?') {
-        return plugins::calc::query(rest.trim());
-    }
-
-    if let Some(rest) = match_prefix(q, "/sys") {
-        return plugins::sys::query(rest);
-    }
-    if let Some(rest) = match_prefix(q, "/app") {
-        return plugins::app_mgmt::query(rest);
-    }
-
-    // Web: allow !gh rust, !gh, or direct URLs
-    if q.starts_with('!') || q.starts_with("http://") || q.starts_with("https://") {
-        return plugins::web::query(q);
-    }
-
-    // 2. Implicit feature routing
-    if plugins::path::is_path(q) {
-        return plugins::path::query(q);
-    }
-
-    // 3. Default: App search
-    app_search(q, index, history, config)
+    search_top_k(index, q, history, config.max_results)
 }
 
-fn match_prefix<'a>(q: &'a str, prefix: &str) -> Option<&'a str> {
-    if q == prefix {
-        return Some("");
+pub fn search_top_k(
+    index: &[Item],
+    query: &str,
+    history: &History,
+    max_results: usize,
+) -> Vec<Item> {
+    if max_results == 0 || index.is_empty() {
+        return Vec::new();
     }
-    if let Some(rest) = q.strip_prefix(prefix)
-        && rest.starts_with(' ')
-    {
-        return Some(rest.trim());
-    }
-    None
-}
 
-fn app_search(q: &str, index: &[Item], history: &History, config: &Config) -> Vec<Item> {
-    let q_lower = q.to_lowercase();
+    let query_lower = query.to_lowercase();
     let mut scored: Vec<(&Item, i32)> = Vec::with_capacity(index.len());
 
     for item in index {
         let f_score = history.get_score(&item.path);
-        if let Some(m) = search::match_item(item, q, &q_lower, f_score) {
+        if let Some(m) = search::match_item(item, query, &query_lower, f_score) {
             scored.push((item, m.score));
         }
     }
 
-    scored.sort_unstable_by(|a, b| match b.1.cmp(&a.1) {
-        std::cmp::Ordering::Equal => a.0.name.cmp(&b.0.name),
+    if scored.is_empty() {
+        return Vec::new();
+    }
+
+    let k = max_results.min(scored.len());
+    if k == 0 {
+        return Vec::new();
+    }
+
+    scored.select_nth_unstable_by(k - 1, |a, b| match b.1.cmp(&a.1) {
+        Ordering::Equal => a.0.name.cmp(&b.0.name),
         other => other,
     });
-    scored
-        .into_iter()
-        .take(config.max_results)
-        .map(|(i, _)| i.clone())
-        .collect()
+
+    scored[..k].sort_unstable_by(|a, b| match b.1.cmp(&a.1) {
+        Ordering::Equal => a.0.name.cmp(&b.0.name),
+        other => other,
+    });
+
+    scored.into_iter().take(k).map(|(i, _)| i.clone()).collect()
 }

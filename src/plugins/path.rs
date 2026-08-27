@@ -1,5 +1,17 @@
 use crate::domain::{Action, Item, ItemKind};
+use crate::plugins::{Plugin, PluginContext};
 use std::sync::Arc;
+
+pub struct PathPlugin;
+
+impl Plugin for PathPlugin {
+    fn can_handle(&self, raw_input: &str) -> bool {
+        is_path(raw_input)
+    }
+    fn query(&self, raw_input: &str, _ctx: &PluginContext) -> Vec<Item> {
+        query(raw_input)
+    }
+}
 
 pub fn is_path(q: &str) -> bool {
     let b = q.as_bytes();

@@ -1,4 +1,17 @@
 use crate::domain::Item;
+use crate::plugins::{Plugin, PluginContext};
+
+pub struct CalcPlugin;
+
+impl Plugin for CalcPlugin {
+    fn can_handle(&self, raw_input: &str) -> bool {
+        raw_input.starts_with('?')
+    }
+    fn query(&self, raw_input: &str, _ctx: &PluginContext) -> Vec<Item> {
+        let rest = raw_input.strip_prefix('?').unwrap_or(raw_input).trim();
+        query(rest)
+    }
+}
 
 pub fn query(args: &str) -> Vec<Item> {
     let q = args.trim().trim_end_matches('=').trim();

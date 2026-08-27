@@ -241,14 +241,20 @@ impl App {
 
     pub fn hide(&mut self, hwnd: HWND) {
         self.query.clear();
+        self.query.shrink_to_fit();
         self.ime_comp.clear();
+        self.ime_comp.shrink_to_fit();
         self.results.clear();
+        self.results.shrink_to_fit();
         self.selected = 0;
         self.hovered = None;
         self.height_spring.reset(metrics::HEADER_HEIGHT as f32);
         self.pill.reset(metrics::LIST_TOP);
         self.spring_animating = false;
         unsafe {
+            let _ = KillTimer(Some(hwnd), TIMER_ANIMATION);
+            let _ = KillTimer(Some(hwnd), crate::TIMER_CARET);
+
             let s = window_scale(hwnd);
             let _ = SetWindowPos(
                 hwnd,

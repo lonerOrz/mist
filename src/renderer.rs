@@ -1,4 +1,4 @@
-use crate::domain::{Item, ItemKind, to_wide, to_wide_slice};
+use crate::domain::{Item, ItemKind, to_wide};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use windows::Win32::Foundation::*;
@@ -444,6 +444,25 @@ impl Spring {
     }
 }
 
+struct D2DScratchpad {
+    utf16_buf: Vec<u16>,
+}
+
+impl D2DScratchpad {
+    pub fn new() -> Self {
+        Self {
+            utf16_buf: Vec::with_capacity(1024),
+        }
+    }
+
+    #[inline]
+    pub fn encode_utf16<'a>(&'a mut self, s: &str) -> &'a [u16] {
+        self.utf16_buf.clear();
+        self.utf16_buf.extend(s.encode_utf16());
+        &self.utf16_buf
+    }
+}
+
 pub struct Renderer {
     d2d_factory: ID2D1Factory,
     dwrite_factory: IDWriteFactory,
@@ -451,6 +470,7 @@ pub struct Renderer {
     font_family: String,
     theme: Theme,
     context: Option<D2DContext>,
+    scratch: D2DScratchpad,
 }
 
 impl Renderer {
@@ -468,6 +488,7 @@ impl Renderer {
                 font_family,
                 theme: Theme::from_config(&crate::config::Config::default()),
                 context: None,
+                scratch: D2DScratchpad::new(),
             })
         }
     }
@@ -666,10 +687,10 @@ impl Renderer {
         let Some(ctx) = &self.context else {
             return 0.0;
         };
-        let text_w = to_wide_slice(text);
+        let text_w = self.scratch.encode_utf16(text);
         if let Ok(layout) = unsafe {
             self.dwrite_factory.CreateTextLayout(
-                &text_w,
+                text_w,
                 &ctx.formats.input,
                 10000.0,
                 metrics::HEADER_HEIGHT as f32,
@@ -716,6 +737,7 @@ impl Renderer {
             let Renderer {
                 icon_cache,
                 context,
+                scratch,
                 ..
             } = self;
             let ctx = context.as_mut().unwrap();
@@ -735,6 +757,10 @@ impl Renderer {
             let target: ID2D1RenderTarget = ctx.target.cast()?;
             target.BeginDraw();
 
+            // ponytail: target.GetSize() returns DIP size matching the dpiX/dpiY coordinate space;
+            // GetClientRect would return physical pixels and stretch all coordinates at >100% DPI.
+            let dip_size = target.GetSize();
+
             target.Clear(Some(&D2D1_COLOR_F {
                 r: 0.11,
                 g: 0.11,
@@ -745,8 +771,8 @@ impl Renderer {
             let win_rect = D2D_RECT_F {
                 left: 0.5,
                 top: 0.5,
-                right: size.width as f32 - 0.5,
-                bottom: size.height as f32 - 0.5,
+                right: dip_size.width - 0.5,
+                bottom: dip_size.height - 0.5,
             };
             target.DrawRectangle(&win_rect, &ctx.brushes.border, 1.0, None);
 
@@ -775,12 +801,12 @@ impl Renderer {
             } else {
                 (query, false)
             };
-            let q_wide = to_wide_slice(text_to_draw);
+            let q_wide = scratch.encode_utf16(text_to_draw);
 
             let mut caret_offset_x = 0.0;
             if !is_placeholder
                 && let Ok(layout) = dwrite_factory.CreateTextLayout(
-                    &q_wide,
+                    q_wide,
                     &ctx.formats.input,
                     10000.0,
                     metrics::HEADER_HEIGHT as f32,
@@ -827,7 +853,7 @@ impl Renderer {
 
             target.PushAxisAlignedClip(&clip_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             target.DrawText(
-                &q_wide,
+                q_wide,
                 &ctx.formats.input,
                 &input_rect,
                 text_brush,
@@ -851,7 +877,7 @@ impl Renderer {
                 let divider_y = metrics::HEADER_HEIGHT as f32;
                 target.DrawLine(
                     Vector2::new(0.0, divider_y),
-                    Vector2::new(size.width as f32, divider_y),
+                    Vector2::new(dip_size.width, divider_y),
                     &ctx.brushes.divider,
                     1.0,
                     None,
@@ -866,7 +892,7 @@ impl Renderer {
                     rect: D2D_RECT_F {
                         left: 8.0,
                         top: pill_y,
-                        right: size.width as f32 - 8.0,
+                        right: dip_size.width - 8.0,
                         bottom: pill_y + item_h - 4.0,
                     },
                     radiusX: theme.pill_radius,
@@ -884,7 +910,7 @@ impl Renderer {
                     rect: D2D_RECT_F {
                         left: 8.0,
                         top,
-                        right: size.width as f32 - 8.0,
+                        right: dip_size.width - 8.0,
                         bottom,
                     },
                     radiusX: theme.pill_radius,
@@ -1007,16 +1033,16 @@ impl Renderer {
                     }
                 }
 
-                let text_max_right = size.width as f32 - 185.0;
+                let text_max_right = dip_size.width - 185.0;
 
-                let title_w = to_wide_slice(&item.name);
+                let title_w = scratch.encode_utf16(&item.name);
                 let title_brush = if is_calc {
                     &ctx.brushes.accent
                 } else {
                     &ctx.brushes.text
                 };
                 target.DrawText(
-                    &title_w,
+                    title_w,
                     &ctx.formats.item_title,
                     &D2D_RECT_F {
                         left: 62.0,
@@ -1029,9 +1055,9 @@ impl Renderer {
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
 
-                let sub_w = to_wide_slice(&item.path);
+                let sub_w = scratch.encode_utf16(&item.path);
                 target.DrawText(
-                    &sub_w,
+                    sub_w,
                     &ctx.formats.item_sub,
                     &D2D_RECT_F {
                         left: 62.0,
@@ -1049,9 +1075,9 @@ impl Renderer {
 
                     let action_rect = D2D1_ROUNDED_RECT {
                         rect: D2D_RECT_F {
-                            left: size.width as f32 - 76.0,
+                            left: dip_size.width - 76.0,
                             top: top + 13.5,
-                            right: size.width as f32 - 16.0,
+                            right: dip_size.width - 16.0,
                             bottom: top + 36.5,
                         },
                         radiusX: theme.button_radius,
@@ -1072,9 +1098,9 @@ impl Renderer {
                         let admin_w = KEY_CAP_ADMIN.as_wide();
                         let admin_rect = D2D1_ROUNDED_RECT {
                             rect: D2D_RECT_F {
-                                left: size.width as f32 - metrics::ADMIN_ZONE_FAR as f32,
+                                left: dip_size.width - metrics::ADMIN_ZONE_FAR as f32,
                                 top: top + 13.5,
-                                right: size.width as f32 - metrics::ADMIN_ZONE_NEAR as f32,
+                                right: dip_size.width - metrics::ADMIN_ZONE_NEAR as f32,
                                 bottom: top + 36.5,
                             },
                             radiusX: theme.button_radius,
