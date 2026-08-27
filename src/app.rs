@@ -136,7 +136,7 @@ impl App {
     pub fn move_selection_up(&mut self, hwnd: HWND) {
         if self.selected > 0 {
             self.selected -= 1;
-            self.pill.set_target(list_item_top(self.selected));
+            self.pill.set_target(metrics::list_item_top(self.selected));
             self.trigger_animation(hwnd);
         }
     }
@@ -144,7 +144,7 @@ impl App {
     pub fn move_selection_down(&mut self, hwnd: HWND) {
         if !self.results.is_empty() && self.selected < self.results.len() - 1 {
             self.selected += 1;
-            self.pill.set_target(list_item_top(self.selected));
+            self.pill.set_target(metrics::list_item_top(self.selected));
             self.trigger_animation(hwnd);
         }
     }
@@ -163,7 +163,7 @@ impl App {
             let changed = self.hovered != Some(idx) || self.selected != idx;
             self.hovered = Some(idx);
             self.selected = idx;
-            self.pill.set_target(list_item_top(idx));
+            self.pill.set_target(metrics::list_item_top(idx));
             if changed {
                 self.trigger_animation(hwnd);
             }
@@ -181,17 +181,16 @@ impl App {
         let idx = ((y - metrics::LIST_TOP) / metrics::ITEM_HEIGHT as f32) as usize;
         if idx < self.results.len() {
             self.selected = idx;
-            self.pill.set_target(list_item_top(idx));
+            self.pill.set_target(metrics::list_item_top(idx));
             let item = &self.results[idx];
             let is_calc = matches!(item.kind, crate::domain::ItemKind::Calculator { .. });
             let is_mgmt = matches!(item.kind, crate::domain::ItemKind::AppMgmt);
 
-            let admin_min_x = (self.config.width - metrics::ADMIN_ZONE_FAR) as f32;
-            let admin_max_x = (self.config.width - metrics::ADMIN_ZONE_NEAR) as f32;
-            let row_top = list_item_top(idx);
-            let in_admin_button = y >= row_top + 13.5 && y <= row_top + 36.5;
-
-            if !is_calc && !is_mgmt && in_admin_button && x >= admin_min_x && x <= admin_max_x {
+            // 统一调用 metrics 模块判定点击区域，消除硬编码魔法数字
+            if !is_calc
+                && !is_mgmt
+                && metrics::is_in_admin_button(idx, self.config.width as f32, x, y)
+            {
                 self.execute_selected_admin(hwnd);
             } else {
                 self.execute_selected(hwnd);
@@ -328,8 +327,4 @@ impl App {
         self.height_spring.target = new_h as f32;
         self.trigger_animation(hwnd);
     }
-}
-
-fn list_item_top(idx: usize) -> f32 {
-    metrics::LIST_TOP + (idx as f32) * metrics::ITEM_HEIGHT as f32
 }

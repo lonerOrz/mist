@@ -22,6 +22,21 @@ pub mod metrics {
     pub const INPUT_X: f32 = 48.0;
     pub const ADMIN_ZONE_FAR: i32 = 176;
     pub const ADMIN_ZONE_NEAR: i32 = 82;
+
+    #[inline]
+    pub fn list_item_top(idx: usize) -> f32 {
+        LIST_TOP + (idx as f32) * ITEM_HEIGHT as f32
+    }
+
+    #[inline]
+    pub fn is_in_admin_button(idx: usize, width: f32, x: f32, y: f32) -> bool {
+        let row_top = list_item_top(idx);
+        let admin_min_x = width - ADMIN_ZONE_FAR as f32;
+        let admin_max_x = width - ADMIN_ZONE_NEAR as f32;
+        let in_y = y >= row_top + 13.5 && y <= row_top + 36.5;
+        let in_x = x >= admin_min_x && x <= admin_max_x;
+        in_y && in_x
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -184,8 +199,9 @@ fn probe_nerd_font_support(dwrite_factory: &IDWriteFactory, font_family: &str) -
 
 pub struct IconCache {
     wic_factory: IWICImagingFactory,
-    cache: HashMap<Arc<str>, Option<ID2D1Bitmap>>,
+    cache: HashMap<Arc<str>, (Option<ID2D1Bitmap>, u64)>,
     loading: HashSet<Arc<str>>,
+    counter: u64,
 }
 
 impl IconCache {
@@ -196,6 +212,7 @@ impl IconCache {
             wic_factory,
             cache: HashMap::new(),
             loading: HashSet::new(),
+            counter: 0,
         })
     }
 
@@ -209,7 +226,11 @@ impl IconCache {
         px: u32,
     ) -> Option<ID2D1Bitmap> {
         let key: Arc<str> = Arc::from(format!("{path}\u{0}{px}"));
-        if let Some(bm) = self.cache.get(&key) {
+        self.counter = self.counter.wrapping_add(1);
+        let current_tick = self.counter;
+
+        if let Some((bm, tick)) = self.cache.get_mut(&key) {
+            *tick = current_tick;
             return bm.clone();
         }
         if self.loading.contains(&key) {
@@ -218,11 +239,17 @@ impl IconCache {
         self.loading.insert(key.clone());
         let loaded = unsafe { self.load_shell_icon(rt, path, px) };
         self.loading.remove(&key);
-        self.cache.insert(key, loaded.clone());
+        self.cache.insert(key, (loaded.clone(), current_tick));
+
+        // 真实 LRU 淘汰：当缓存超过 512 个时，按访问时间戳顺序精确剔除最旧的 256 个项
         if self.cache.len() > 512 {
-            let n = self.cache.len() - 256;
-            let to_drop: Vec<Arc<str>> = self.cache.keys().take(n).cloned().collect();
-            for k in to_drop {
+            let mut entries: Vec<(Arc<str>, u64)> = self
+                .cache
+                .iter()
+                .map(|(k, (_, tick))| (k.clone(), *tick))
+                .collect();
+            entries.sort_unstable_by_key(|(_, tick)| *tick);
+            for (k, _) in entries.into_iter().take(256) {
                 self.cache.remove(&k);
             }
         }

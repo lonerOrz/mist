@@ -14,6 +14,7 @@ use app::{App, TIMER_ANIMATION};
 use config::{Config, HOTKEY_FALLBACK_ID, HOTKEY_ID};
 use domain::Item;
 use renderer::{Renderer, metrics, window_scale};
+use std::sync::atomic::{AtomicU16, Ordering};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -33,9 +34,10 @@ use windows::core::*;
 
 const WM_INDEX_READY: u32 = WM_USER + 1;
 const WM_CONFIG_RELOADED: u32 = WM_USER + 2;
+const WM_ACTIVATE_INSTANCE: u32 = WM_USER + 3;
 const TIMER_CARET: usize = 1;
 
-static SURROGATE_PAIR: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+static SURROGATE_PAIR: AtomicU16 = AtomicU16::new(0);
 
 fn parse_hotkey(hotkey_str: &str) -> (HOT_KEY_MODIFIERS, VIRTUAL_KEY) {
     let mut mods = HOT_KEY_MODIFIERS(MOD_NOREPEAT.0);
@@ -126,7 +128,7 @@ fn main() -> Result<()> {
         }
     }
 
-    unsafe {
+    let mutex_handle = unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
         let mutex_name_wide = domain::to_wide("MistLauncherMutex");
@@ -134,17 +136,13 @@ fn main() -> Result<()> {
 
         if GetLastError() == ERROR_ALREADY_EXISTS {
             if let Ok(existing) = FindWindowW(w!("MistLauncherClass"), None) {
-                let _ = PostMessageW(
-                    Some(existing),
-                    WM_HOTKEY,
-                    WPARAM(HOTKEY_ID as usize),
-                    LPARAM(0),
-                );
+                let _ = PostMessageW(Some(existing), WM_ACTIVATE_INSTANCE, WPARAM(0), LPARAM(0));
             }
             let _ = CloseHandle(handle);
             return Ok(());
         }
-    }
+        handle
+    };
 
     if let Ok(home) = std::env::var("USERPROFILE") {
         let _ = std::env::set_current_dir(home);
@@ -263,6 +261,7 @@ fn main() -> Result<()> {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        let _ = CloseHandle(mutex_handle);
         CoUninitialize();
     }
     Ok(())
@@ -280,8 +279,8 @@ unsafe extern "system" fn wnd_proc(
         WM_ERASEBKGND => LRESULT(1),
 
         WM_SETCURSOR => {
-            let hit_test = (lparam.0 & 0xffff) as i32;
-            if hit_test == 1 {
+            let hit_test = (lparam.0 & 0xffff) as u32;
+            if hit_test == HTCLIENT {
                 let mut pt = POINT::default();
                 let _ = unsafe { GetCursorPos(&mut pt) };
                 let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
@@ -329,7 +328,6 @@ unsafe extern "system" fn wnd_proc(
                     app.set_index(*boxed);
                     app.on_query_change(hwnd);
                 }
-                // keep hot pages in memory to avoid first-key page faults
             }
             LRESULT(0)
         }
@@ -362,6 +360,7 @@ unsafe extern "system" fn wnd_proc(
                     );
                 }
                 app.renderer.invalidate();
+                app.update_ime_position(hwnd);
                 let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
             }
             LRESULT(0)
@@ -377,18 +376,26 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
 
+        WM_ACTIVATE_INSTANCE => {
+            unsafe {
+                toggle_window(hwnd);
+            }
+            LRESULT(0)
+        }
+
         WM_CHAR => {
             if let Some(app) = app_opt {
                 let code = wparam.0 as u16;
                 if (0xD800..=0xDBFF).contains(&code) {
-                    SURROGATE_PAIR.store(code, std::sync::atomic::Ordering::Relaxed);
+                    SURROGATE_PAIR.store(code, Ordering::Relaxed);
                 } else {
                     let full_char = if (0xDC00..=0xDFFF).contains(&code)
-                        && SURROGATE_PAIR.load(std::sync::atomic::Ordering::Relaxed) != 0
+                        && SURROGATE_PAIR.load(Ordering::Relaxed) != 0
                     {
-                        let high = SURROGATE_PAIR.swap(0, std::sync::atomic::Ordering::Relaxed);
+                        let high = SURROGATE_PAIR.swap(0, Ordering::Relaxed);
                         char::decode_utf16([high, code]).next().and_then(|r| r.ok())
                     } else {
+                        SURROGATE_PAIR.store(0, Ordering::Relaxed);
                         char::from_u32(code as u32)
                     };
 
@@ -453,6 +460,7 @@ unsafe extern "system" fn wnd_proc(
         }
 
         WM_IME_STARTCOMPOSITION => {
+            SURROGATE_PAIR.store(0, Ordering::Relaxed);
             if let Some(app) = app_opt {
                 app.ime_comp.clear();
                 app.update_ime_position(hwnd);
@@ -531,6 +539,7 @@ unsafe extern "system" fn wnd_proc(
         }
 
         WM_KILLFOCUS => {
+            SURROGATE_PAIR.store(0, Ordering::Relaxed);
             if let Some(app) = app_opt {
                 app.hide(hwnd);
             }
@@ -624,7 +633,7 @@ unsafe extern "system" fn wnd_proc(
                     &mut pending,
                     Some(hwnd),
                     WM_INDEX_READY,
-                    WM_CONFIG_RELOADED,
+                    WM_ACTIVATE_INSTANCE,
                     PM_REMOVE,
                 )
                 .into()

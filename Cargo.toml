@@ -55,6 +55,3 @@ lto = true           # Whole-program link-time optimization
 codegen-units = 1    # Single codegen unit for maximum optimization
 panic = "abort"      # Drop unwind tables and landing pads
 strip = true         # Strip debug symbols and metadata
-
-[build-dependencies]
-unicode-normalization = "0.1"
