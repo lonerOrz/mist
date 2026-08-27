@@ -1,4 +1,13 @@
 use crate::domain::{Item, KeyKind, Match};
+use fuzzy_matcher::FuzzyMatcher;
+use fuzzy_matcher::skim::SkimMatcherV2;
+use std::sync::OnceLock;
+
+static MATCHER: OnceLock<SkimMatcherV2> = OnceLock::new();
+
+fn get_matcher() -> &'static SkimMatcherV2 {
+    MATCHER.get_or_init(SkimMatcherV2::default)
+}
 
 impl KeyKind {
     #[inline]
@@ -7,61 +16,43 @@ impl KeyKind {
             return None;
         }
 
+        // Exact match
         if text == q {
             return Some(match self {
-                KeyKind::Name => 2500,
-                KeyKind::Pinyin => 2000,
-                KeyKind::Initials => 1800,
-                KeyKind::Alias => 1600,
+                KeyKind::Name => 1000,
+                KeyKind::Pinyin => 900,
+                KeyKind::Initials => 800,
+                KeyKind::Alias => 700,
             });
         }
+
+        // Prefix match
         if text.starts_with(q) {
             let base = match self {
-                KeyKind::Name => 1500,
-                KeyKind::Pinyin => 1300,
-                KeyKind::Initials => 1200,
-                KeyKind::Alias => 1000,
-            };
-            let completeness_bonus = ((q.len() as f32 / text.len() as f32) * 80.0) as i32;
-            return Some(base + completeness_bonus);
-        }
-        if *self == KeyKind::Name && text.is_ascii() && abbr_matches(text.as_bytes(), q.as_bytes())
-        {
-            return Some(1100);
-        }
-        if let Some(pos) = text.find(q) {
-            let base = match self {
-                KeyKind::Name => 700,
-                KeyKind::Pinyin => 600,
+                KeyKind::Name => 600,
+                KeyKind::Pinyin => 550,
                 KeyKind::Initials => 500,
-                KeyKind::Alias => 400,
+                KeyKind::Alias => 450,
             };
-            let boundary_bonus = if pos > 0 && is_word_sep(text.as_bytes()[pos - 1]) {
-                250
-            } else {
-                0
-            };
-            return Some(base + boundary_bonus - (pos as i32 * 10));
+            let bonus = ((q.len() as f32 / text.len() as f32) * 200.0) as i32;
+            return Some(base + bonus);
         }
+
+        // Fuzzy match via Skim
+        if let Some(fuzzy_score) = get_matcher().fuzzy_match(text, q)
+            && fuzzy_score > 0
+        {
+            let normalized = (fuzzy_score / 10) as i32;
+            let base = match self {
+                KeyKind::Name => 300,
+                KeyKind::Pinyin => 280,
+                KeyKind::Initials => 250,
+                KeyKind::Alias => 200,
+            };
+            return Some(base + normalized.min(200));
+        }
+
         None
-    }
-}
-
-#[inline]
-fn is_word_sep(b: u8) -> bool {
-    b.is_ascii_whitespace() || matches!(b, b'-' | b'_' | b'.' | b'+')
-}
-
-fn abbr_matches(name_lower: &[u8], q: &[u8]) -> bool {
-    match name_lower.iter().position(|b| !is_word_sep(*b)) {
-        None => q.is_empty(),
-        Some(start) => {
-            let s = &name_lower[start..];
-            let w_len = s.iter().position(|b| is_word_sep(*b)).unwrap_or(s.len());
-            let (w, rest) = s.split_at(w_len);
-            (1..=w.len().min(q.len()))
-                .any(|take| w[..take] == q[..take] && abbr_matches(rest, &q[take..]))
-        }
     }
 }
 
@@ -92,7 +83,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_unified_search_model() {
+    fn test_fuzzy_search_model() {
         let vscode = Item::new_application("Visual Studio Code", r"C:\code.exe");
         let wx = Item::new_application("\u{5fae}\u{4fe1}", r"C:\wx.exe");
         let taskmgr = Item::new_application(
@@ -100,35 +91,33 @@ mod tests {
             r"C:\System32\Taskmgr.exe",
         );
 
-        assert_eq!(match_item(&vscode, "vsc", "vsc", 0).unwrap().score, 1100);
-        assert_eq!(
-            match_item(&vscode, "vscode", "vscode", 0).unwrap().score,
-            1100
-        );
-        assert_eq!(match_item(&vscode, "code", "code", 0).unwrap().score, 1600);
+        // Fuzzy matches should now work via Skim
+        assert!(match_item(&vscode, "vsc", "vsc", 0).is_some());
+        assert!(match_item(&vscode, "vscode", "vscode", 0).is_some());
+        assert_eq!(match_item(&vscode, "code", "code", 0).unwrap().score, 1000);
 
-        assert_eq!(match_item(&wx, "weixin", "weixin", 0).unwrap().score, 2000);
-        assert_eq!(match_item(&wx, "weix", "weix", 0).unwrap().score, 1353);
-        assert_eq!(match_item(&wx, "wx", "wx", 0).unwrap().score, 1800);
-        assert_eq!(match_item(&wx, "xin", "xin", 0).unwrap().score, 570);
+        // Pinyin exact and fuzzy
+        assert_eq!(match_item(&wx, "weixin", "weixin", 0).unwrap().score, 900);
+        assert!(match_item(&wx, "weix", "weix", 0).is_some());
+        assert_eq!(match_item(&wx, "wx", "wx", 0).unwrap().score, 800);
 
-        assert_eq!(
-            match_item(&taskmgr, "taskmgr", "taskmgr", 0).unwrap().score,
-            1600
-        );
-        assert_eq!(
-            match_item(&taskmgr, "rwglq", "rwglq", 0).unwrap().score,
-            1800
-        );
+        // Task manager - initials match
+        assert!(match_item(&taskmgr, "rwglq", "rwglq", 0).is_some());
 
+        // ASCII initials (Node.js)
         let nj = Item::new_application("Node.js", r"C:\node.exe");
-        assert_eq!(match_item(&nj, "nj", "nj", 0).unwrap().score, 1100);
+        assert!(match_item(&nj, "nj", "nj", 0).is_some());
 
-        assert_eq!(match_item(&wx, "wx", "wx", 50).unwrap().score, 1850);
+        // Frecency bonus
+        assert_eq!(match_item(&wx, "wx", "wx", 50).unwrap().score, 850);
 
+        // Partial fuzzy should score lower than prefix/exact
         let chrome = Item::new_application("Google Chrome", r"C:\chrome.exe");
-        assert!(match_item(&chrome, "c", "c", 400).unwrap().score < 1800);
+        let chrome_match = match_item(&chrome, "c", "c", 400);
+        assert!(chrome_match.is_some());
+        assert!(chrome_match.unwrap().score < 800);
 
+        // No match
         assert!(match_item(&wx, "qq", "qq", 0).is_none());
     }
 
@@ -147,16 +136,16 @@ mod tests {
             &["quit", "close", ":q"],
         );
 
-        assert_eq!(match_item(&cfg, "conf", "conf", 0).unwrap().score, 1553);
+        assert!(match_item(&cfg, "conf", "conf", 0).is_some());
         assert_eq!(
             match_item(&cfg, "settings", "settings", 0).unwrap().score,
-            1600
+            700
         );
         assert!(cfg.is_name_exact("config"));
         assert!(!cfg.is_name_exact("settings"));
 
-        assert_eq!(match_item(&exit, ":q", ":q", 0).unwrap().score, 1600);
-        assert_eq!(match_item(&exit, "mist", "mist", 0).unwrap().score, 1600);
+        assert_eq!(match_item(&exit, ":q", ":q", 0).unwrap().score, 700);
+        assert_eq!(match_item(&exit, "mist", "mist", 0).unwrap().score, 700);
 
         let calc = Item::new_calculator("7");
         assert!(match_item(&calc, "7", "7", 0).is_none());

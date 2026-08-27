@@ -72,7 +72,13 @@ impl Action {
             }
             Action::RestartApp => {
                 if let Ok(exe) = std::env::current_exe() {
-                    let _ = std::process::Command::new(exe).spawn();
+                    let current_pid = std::process::id();
+                    use std::os::windows::process::CommandExt;
+                    let _ = std::process::Command::new(&exe)
+                        .arg("--restarted-from")
+                        .arg(current_pid.to_string())
+                        .creation_flags(0x00000008 | 0x00000200)
+                        .spawn();
                 }
                 unsafe {
                     PostQuitMessage(0);
@@ -249,54 +255,41 @@ impl Item {
         let mut keys: Vec<(KeyKind, Arc<str>)> =
             vec![(KeyKind::Name, Arc::from(name_lower.as_str()))];
 
-        // Collect per-character pinyin options: ASCII chars have 1 option,
-        // CJK chars may have multiple pronunciations via heteronym support.
-        let mut char_options: Vec<Vec<&str>> = Vec::new();
+        let mut pinyin_full = String::new();
+        let mut pinyin_initials = String::new();
         let mut has_cjk = false;
 
         for c in name.chars() {
             if c.is_ascii_alphanumeric() {
-                let lower = c.to_ascii_lowercase().to_string();
-                char_options.push(vec![Box::leak(lower.into_boxed_str())]);
+                let lower = c.to_ascii_lowercase();
+                pinyin_full.push(lower);
+                pinyin_initials.push(lower);
             } else if let Some(multi) = c.to_pinyin_multi() {
                 has_cjk = true;
-                let options: Vec<&str> = multi.into_iter().map(|py| py.plain()).collect();
-                char_options.push(options);
-            } else {
-                // Unknown CJK char — skip
+                let mut char_pinyins = Vec::new();
+                let mut char_initials = Vec::new();
+                for py in multi {
+                    let plain = py.plain();
+                    char_pinyins.push(plain.to_string());
+                    if let Some(first) = plain.chars().next() {
+                        char_initials.push(first);
+                    }
+                }
+                pinyin_full.push_str(&char_pinyins.join(" "));
+                pinyin_full.push(' ');
+                char_initials.sort();
+                char_initials.dedup();
+                pinyin_initials.push_str(&char_initials.iter().collect::<String>());
+                pinyin_initials.push(' ');
             }
         }
 
-        if has_cjk && !char_options.is_empty() {
-            // Generate Cartesian product of all pronunciation combinations,
-            // capped at MAX_COMBINATIONS to avoid explosion on long names.
-            const MAX_COMBINATIONS: usize = 16;
-            let mut combinations: Vec<(String, String)> = vec![(String::new(), String::new())];
-
-            for options in char_options {
-                let mut next = Vec::new();
-                for (full, initials) in &combinations {
-                    for py in &options {
-                        let mut new_full = full.clone();
-                        let mut new_init = initials.clone();
-                        new_full.push_str(py);
-                        if let Some(first) = py.chars().next() {
-                            new_init.push(first);
-                        }
-                        next.push((new_full, new_init));
-                    }
-                }
-                next.truncate(MAX_COMBINATIONS);
-                combinations = next;
+        if has_cjk {
+            if !pinyin_full.is_empty() {
+                keys.push((KeyKind::Pinyin, Arc::from(pinyin_full.trim_end())));
             }
-
-            for (full, initials) in combinations {
-                if !full.is_empty() && !keys.iter().any(|(_, k)| k.as_ref() == full) {
-                    keys.push((KeyKind::Pinyin, Arc::from(full)));
-                }
-                if !initials.is_empty() && !keys.iter().any(|(_, k)| k.as_ref() == initials) {
-                    keys.push((KeyKind::Initials, Arc::from(initials)));
-                }
+            if !pinyin_initials.is_empty() {
+                keys.push((KeyKind::Initials, Arc::from(pinyin_initials)));
             }
         }
 

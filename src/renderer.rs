@@ -208,7 +208,7 @@ impl IconCache {
         path: &Arc<str>,
         px: u32,
     ) -> Option<ID2D1Bitmap> {
-        let key: Arc<str> = Arc::from(format!("{path}\u{0}{px}").as_str());
+        let key: Arc<str> = Arc::from(format!("{path}\u{0}{px}"));
         if let Some(bm) = self.cache.get(&key) {
             return bm.clone();
         }

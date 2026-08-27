@@ -45,9 +45,10 @@ impl History {
 
         let (tx, rx) = channel::<String>();
         let worker_records = records.clone();
-        let mut serialize_buffer = String::with_capacity(1024);
         let worker = std::thread::spawn(move || {
             let mut records = worker_records;
+            let mut serialize_buffer = String::with_capacity(1024);
+
             while let Ok(key) = rx.recv() {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -59,6 +60,15 @@ impl History {
                 });
                 entry.count = entry.count.saturating_add(1);
                 entry.last_used = now;
+
+                while let Ok(k) = rx.try_recv() {
+                    let entry = records.entry(k).or_insert(Record {
+                        count: 0,
+                        last_used: now,
+                    });
+                    entry.count = entry.count.saturating_add(1);
+                    entry.last_used = now;
+                }
 
                 serialize_buffer.clear();
                 for (k, rec) in &records {
@@ -117,7 +127,7 @@ impl History {
                 20
             };
 
-            ((rec.count as i32) * multiplier).min(400)
+            ((rec.count as i32) * multiplier).min(800)
         } else {
             0
         }

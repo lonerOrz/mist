@@ -11,7 +11,7 @@ pub mod search;
 pub mod sources;
 
 use app::{App, TIMER_ANIMATION};
-use config::Config;
+use config::{Config, HOTKEY_FALLBACK_ID, HOTKEY_ID};
 use domain::Item;
 use renderer::{Renderer, metrics, window_scale};
 use windows::Win32::Foundation::*;
@@ -31,8 +31,6 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
-const HOTKEY_ID: i32 = 1001;
-const HOTKEY_FALLBACK_ID: i32 = 1002;
 const WM_INDEX_READY: u32 = WM_USER + 1;
 const WM_CONFIG_RELOADED: u32 = WM_USER + 2;
 const TIMER_CARET: usize = 1;
@@ -52,6 +50,18 @@ fn parse_hotkey(hotkey_str: &str) -> (HOT_KEY_MODIFIERS, VIRTUAL_KEY) {
             "win" | "super" => mods.0 |= MOD_WIN.0,
             "space" => vk = VK_SPACE,
             "tab" => vk = VK_TAB,
+            "f1" => vk = VK_F1,
+            "f2" => vk = VK_F2,
+            "f3" => vk = VK_F3,
+            "f4" => vk = VK_F4,
+            "f5" => vk = VK_F5,
+            "f6" => vk = VK_F6,
+            "f7" => vk = VK_F7,
+            "f8" => vk = VK_F8,
+            "f9" => vk = VK_F9,
+            "f10" => vk = VK_F10,
+            "f11" => vk = VK_F11,
+            "f12" => vk = VK_F12,
             _ => {
                 if let Some(c) = part.chars().next() {
                     let code = c.to_ascii_uppercase() as u16;
@@ -101,10 +111,27 @@ fn apply_corner(hwnd: HWND, radius: f32) {
 }
 
 fn main() -> Result<()> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--restarted-from"
+            && let Some(pid_str) = args.next()
+            && let Ok(pid) = pid_str.parse::<u32>()
+        {
+            unsafe {
+                if let Ok(process_handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+                    let _ = WaitForSingleObject(process_handle, 5000);
+                    let _ = CloseHandle(process_handle);
+                }
+            }
+        }
+    }
+
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-        let _guard = CreateMutexW(None, false, w!("MistLauncherMutex"))?;
+        let mutex_name_wide = domain::to_wide("MistLauncherMutex");
+        let handle = CreateMutexW(None, false, PCWSTR(mutex_name_wide.as_ptr()))?;
+
         if GetLastError() == ERROR_ALREADY_EXISTS {
             if let Ok(existing) = FindWindowW(w!("MistLauncherClass"), None) {
                 let _ = PostMessageW(
@@ -114,6 +141,7 @@ fn main() -> Result<()> {
                     LPARAM(0),
                 );
             }
+            let _ = CloseHandle(handle);
             return Ok(());
         }
     }

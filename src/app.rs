@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, HOTKEY_FALLBACK_ID, HOTKEY_ID};
 use crate::domain::Item;
 use crate::history::History;
 use crate::renderer::{Renderer, Spring, Theme, metrics, window_scale};
@@ -9,6 +9,7 @@ use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetS
 use windows::Win32::UI::Input::Ime::{
     CFS_POINT, COMPOSITIONFORM, ImmGetContext, ImmReleaseContext, ImmSetCompositionWindow,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::UnregisterHotKey;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const TIMER_ANIMATION: usize = 2;
@@ -203,6 +204,16 @@ impl App {
             let action = item.action.clone();
             let path = item.path.clone();
             self.history.record_launch(&path);
+
+            if matches!(action, crate::domain::Action::RestartApp) {
+                unsafe {
+                    let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+                    let _ = UnregisterHotKey(Some(hwnd), HOTKEY_FALLBACK_ID);
+                }
+                action.execute();
+                return;
+            }
+
             action.execute();
             self.hide(hwnd);
         }
@@ -213,6 +224,16 @@ impl App {
             let action = item.action.clone();
             let path = item.path.clone();
             self.history.record_launch(&path);
+
+            if matches!(action, crate::domain::Action::RestartApp) {
+                unsafe {
+                    let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+                    let _ = UnregisterHotKey(Some(hwnd), HOTKEY_FALLBACK_ID);
+                }
+                action.execute();
+                return;
+            }
+
             action.execute_as_admin();
             self.hide(hwnd);
         }
@@ -220,7 +241,6 @@ impl App {
 
     pub fn hide(&mut self, hwnd: HWND) {
         self.query.clear();
-        self.ime_comp.clear();
         self.ime_comp.clear();
         self.results.clear();
         self.selected = 0;

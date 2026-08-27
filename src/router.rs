@@ -69,7 +69,10 @@ fn app_search(q: &str, index: &[Item], history: &History, config: &Config) -> Ve
         }
     }
 
-    scored.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
+    scored.sort_unstable_by(|a, b| match b.1.cmp(&a.1) {
+        std::cmp::Ordering::Equal => a.0.name.cmp(&b.0.name),
+        other => other,
+    });
     scored
         .into_iter()
         .take(config.max_results)

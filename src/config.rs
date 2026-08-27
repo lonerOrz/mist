@@ -13,6 +13,9 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
+pub const HOTKEY_ID: i32 = 1001;
+pub const HOTKEY_FALLBACK_ID: i32 = 1002;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_hotkey")]
