@@ -14,7 +14,6 @@ use windows::Win32::System::Registry::{
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 pub const HOTKEY_ID: i32 = 1001;
-pub const HOTKEY_FALLBACK_ID: i32 = 1002;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -44,7 +43,7 @@ pub struct Config {
 }
 
 fn default_hotkey() -> String {
-    "Ctrl+Space".into()
+    "Alt+Space".into()
 }
 fn default_placeholder() -> String {
     "Search apps, commands, or calculate...".into()
@@ -133,8 +132,8 @@ pub fn sync_autostart(enable: bool) {
 
 const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Mist Launcher Configuration
 
-# Shortcut hotkey to toggle the launcher window (e.g. "Ctrl+Space", "Alt+Space", "Win+Space")
-hotkey = "Ctrl+Space"
+# Shortcut hotkey to toggle the launcher window (e.g. "Alt+Space", "Ctrl+Space", "Win+Space")
+hotkey = "Alt+Space"
 
 # Placeholder text shown in the search box
 placeholder = "Search apps, commands, or calculate..."

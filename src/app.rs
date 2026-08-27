@@ -1,4 +1,4 @@
-use crate::config::{Config, HOTKEY_FALLBACK_ID, HOTKEY_ID};
+use crate::config::{Config, HOTKEY_ID};
 use crate::domain::Item;
 use crate::history::History;
 use crate::renderer::{Renderer, Spring, Theme, metrics, window_scale};
@@ -207,7 +207,6 @@ impl App {
             if matches!(action, crate::domain::Action::RestartApp) {
                 unsafe {
                     let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
-                    let _ = UnregisterHotKey(Some(hwnd), HOTKEY_FALLBACK_ID);
                 }
                 action.execute();
                 return;
@@ -227,7 +226,6 @@ impl App {
             if matches!(action, crate::domain::Action::RestartApp) {
                 unsafe {
                     let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
-                    let _ = UnregisterHotKey(Some(hwnd), HOTKEY_FALLBACK_ID);
                 }
                 action.execute();
                 return;

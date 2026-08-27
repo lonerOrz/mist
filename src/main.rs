@@ -11,7 +11,7 @@ pub mod search;
 pub mod sources;
 
 use app::{App, TIMER_ANIMATION};
-use config::{Config, HOTKEY_FALLBACK_ID, HOTKEY_ID};
+use config::{Config, HOTKEY_ID};
 use domain::Item;
 use renderer::{Renderer, metrics, window_scale};
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -82,17 +82,9 @@ fn parse_hotkey(hotkey_str: &str) -> (HOT_KEY_MODIFIERS, VIRTUAL_KEY) {
 fn apply_hotkeys(hwnd: HWND, hotkey_str: &str) {
     unsafe {
         let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
-        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_FALLBACK_ID);
 
         let (mods, vk) = parse_hotkey(hotkey_str);
-        if RegisterHotKey(Some(hwnd), HOTKEY_ID, mods, vk.0 as u32).is_err() {
-            let _ = RegisterHotKey(
-                Some(hwnd),
-                HOTKEY_FALLBACK_ID,
-                HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_NOREPEAT.0),
-                VK_SPACE.0 as u32,
-            );
-        }
+        let _ = RegisterHotKey(Some(hwnd), HOTKEY_ID, mods, vk.0 as u32);
     }
 }
 
@@ -370,7 +362,7 @@ unsafe extern "system" fn wnd_proc(
 
         WM_HOTKEY => {
             let id = wparam.0 as i32;
-            if id == HOTKEY_ID || id == HOTKEY_FALLBACK_ID {
+            if id == HOTKEY_ID {
                 unsafe {
                     toggle_window(hwnd);
                 }
@@ -654,7 +646,6 @@ unsafe extern "system" fn wnd_proc(
                 }
 
                 let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
-                let _ = UnregisterHotKey(Some(hwnd), HOTKEY_FALLBACK_ID);
                 let _ = KillTimer(Some(hwnd), TIMER_CARET);
                 let _ = KillTimer(Some(hwnd), TIMER_ANIMATION);
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;

@@ -4,7 +4,7 @@ A lightweight Windows launcher written in Rust.
 
 ## Features
 
-- Application indexing from Start Menu, Desktop, UWP apps, PATH, and App Paths.
+- Application indexing from Start Menu, Desktop, UWP apps, and App Paths.
 - Sub-string, acronym, and Pinyin search with frecency scoring.
 - Plugin-based architecture with explicit prefix routing.
 - Direct2D rendering with acrylic backdrop and spring animations.
@@ -25,17 +25,21 @@ A lightweight Windows launcher written in Rust.
 
 | Key              | Action                              |
 | ---------------- | ----------------------------------- |
-| `Ctrl+Space`     | Toggle window                       |
+| `Alt+Space`      | Toggle window                       |
 | `Up` / `Down`    | Navigate items                      |
 | `Enter`          | Execute selected item / copy result |
 | `Shift+Enter`    | Execute as administrator            |
 | `Ctrl+Backspace` | Delete previous word                |
 | `Esc`            | Hide window                         |
 
-## Build and Run
+## Build
 
 ```bash
-cargo zigbuild --target x86_64-pc-windows-gnu
+# Native
+cargo build --target x86_64-pc-windows-gnu --release
+
+# Or cross-compile cleanly with zig (recommended for reproducible builds)
+cargo zigbuild --target x86_64-pc-windows-gnu --release
 ```
 
 Binary is output to `target/x86_64-pc-windows-gnu/release/mist.exe`
