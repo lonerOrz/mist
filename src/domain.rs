@@ -89,8 +89,6 @@ impl Action {
                 let (file, params, working_dir) =
                     if let Some(cmd) = path_str.strip_prefix("cmd.exe /k ") {
                         ("cmd.exe", format!("/k {cmd}"), String::new())
-                    } else if let Some(cmd) = path_str.strip_prefix("cmd.exe /c ") {
-                        ("cmd.exe", format!("/c {cmd}"), String::new())
                     } else if path_str.starts_with("shell:AppsFolder\\")
                         || path_str.to_lowercase().ends_with(".lnk")
                         || path_str.to_lowercase().ends_with(".url")
