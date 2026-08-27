@@ -103,13 +103,23 @@ fn scan_app_paths() -> Vec<Item> {
                         if expanded_exe.is_empty() {
                             continue;
                         }
+                        let clean_path = if let Some(stripped) = expanded_exe.strip_prefix('"') {
+                            stripped.split('"').next().unwrap_or(&expanded_exe)
+                        } else {
+                            expanded_exe
+                                .split_whitespace()
+                                .next()
+                                .unwrap_or(&expanded_exe)
+                        };
+
                         let stem = Path::new(&name)
                             .file_stem()
                             .and_then(|s| s.to_str())
                             .unwrap_or(&name)
                             .to_lowercase();
-                        if is_valid_executable(Path::new(&expanded_exe)) {
-                            items.push(Item::new_application(&stem, &expanded_exe));
+
+                        if is_valid_executable(Path::new(&clean_path)) {
+                            items.push(Item::new_application(&stem, clean_path));
                         }
                     }
                 }

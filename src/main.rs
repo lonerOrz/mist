@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint};
 use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::System::Threading::*;
@@ -29,6 +30,7 @@ use windows::Win32::UI::Input::Ime::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
@@ -669,6 +671,28 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
+fn get_target_monitor_rect() -> RECT {
+    unsafe {
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut mi).as_bool() {
+            mi.rcWork
+        } else {
+            RECT {
+                left: 0,
+                top: 0,
+                right: GetSystemMetrics(SM_CXSCREEN),
+                bottom: GetSystemMetrics(SM_CYSCREEN),
+            }
+        }
+    }
+}
+
 unsafe fn toggle_window(hwnd: HWND) {
     unsafe {
         let is_visible = IsWindowVisible(hwnd).as_bool();
@@ -696,14 +720,22 @@ unsafe fn toggle_window(hwnd: HWND) {
                 let _ = SetTimer(Some(hwnd), TIMER_CARET, blink, None);
 
                 let s = window_scale(hwnd);
+                let work_area = get_target_monitor_rect();
+                let work_w = work_area.right - work_area.left;
+                let work_h = work_area.bottom - work_area.top;
+                let win_w = (app.config.width as f32 * s).round() as i32;
+                let win_h = (metrics::HEADER_HEIGHT as f32 * s).round() as i32;
+                let x = work_area.left + (work_w - win_w) / 2;
+                let y = work_area.top + (work_h - win_h) / 3;
+
                 let _ = SetWindowPos(
                     hwnd,
                     Some(HWND_TOPMOST),
-                    0,
-                    0,
-                    (app.config.width as f32 * s).round() as i32,
-                    (metrics::HEADER_HEIGHT as f32 * s).round() as i32,
-                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+                    x,
+                    y,
+                    win_w,
+                    win_h,
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
                 );
 
                 let items: Vec<&Item> = app.results.iter().collect();
