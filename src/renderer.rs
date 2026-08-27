@@ -220,7 +220,11 @@ impl IconCache {
         self.loading.remove(&key);
         self.cache.insert(key, loaded.clone());
         if self.cache.len() > 512 {
-            self.cache.clear();
+            let n = self.cache.len() - 256;
+            let to_drop: Vec<Arc<str>> = self.cache.keys().take(n).cloned().collect();
+            for k in to_drop {
+                self.cache.remove(&k);
+            }
         }
         loaded
     }
@@ -654,6 +658,41 @@ impl Renderer {
         }
     }
 
+    pub fn calculate_caret_offset(&mut self, hwnd: HWND, text: &str) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let _ = unsafe { self.ensure_context(hwnd) };
+        let Some(ctx) = &self.context else {
+            return 0.0;
+        };
+        let text_w = to_wide_slice(text);
+        if let Ok(layout) = unsafe {
+            self.dwrite_factory.CreateTextLayout(
+                &text_w,
+                &ctx.formats.input,
+                10000.0,
+                metrics::HEADER_HEIGHT as f32,
+            )
+        } {
+            let mut x = 0.0;
+            let mut y = 0.0;
+            let mut hit_metrics = DWRITE_HIT_TEST_METRICS::default();
+            let _ = unsafe {
+                layout.HitTestTextPosition(
+                    text_w.len() as u32,
+                    false,
+                    &mut x,
+                    &mut y,
+                    &mut hit_metrics,
+                )
+            };
+            x
+        } else {
+            0.0
+        }
+    }
+
     /// # Safety
     ///
     /// `hwnd` must be an initialized and active window handle on the UI thread.
@@ -1006,13 +1045,7 @@ impl Renderer {
                 );
 
                 if i == selected {
-                    let action_str = if is_calc {
-                        KEY_CAP_COPY
-                    } else if is_mgmt {
-                        KEY_CAP_OPEN
-                    } else {
-                        KEY_CAP_OPEN
-                    };
+                    let action_str = if is_calc { KEY_CAP_COPY } else { KEY_CAP_OPEN };
 
                     let action_rect = D2D1_ROUNDED_RECT {
                         rect: D2D_RECT_F {

@@ -14,6 +14,7 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "1.1"
 windows-numerics = "0.3"
 notify = "8.2"
+pinyin = "0.10"
 
 [dependencies.windows]
 version = "0.62"
@@ -44,6 +45,7 @@ features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Dwm",
     "Win32_UI_HiDpi",
+    "Win32_UI_Input_Ime",
 ]
 
 [profile.release]

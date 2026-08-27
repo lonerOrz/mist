@@ -1,4 +1,5 @@
 use crate::config;
+use pinyin::ToPinyinMulti;
 use std::path::Path;
 use std::sync::Arc;
 use windows::Win32::Foundation::*;
@@ -247,34 +248,73 @@ impl Item {
         let name_lower = name.to_lowercase();
         let mut keys: Vec<(KeyKind, Arc<str>)> =
             vec![(KeyKind::Name, Arc::from(name_lower.as_str()))];
-        let mut initials = String::with_capacity(name.len());
-        let mut full = String::with_capacity(name.len() * 4);
+
+        // Collect per-character pinyin options: ASCII chars have 1 option,
+        // CJK chars may have multiple pronunciations via heteronym support.
+        let mut char_options: Vec<Vec<&str>> = Vec::new();
         let mut has_cjk = false;
+
         for c in name.chars() {
             if c.is_ascii_alphanumeric() {
-                let lower = c.to_ascii_lowercase();
-                initials.push(lower);
-                full.push(lower);
-            } else if let Some(py) = crate::pinyin::get_char_pinyin(c) {
+                let lower = c.to_ascii_lowercase().to_string();
+                char_options.push(vec![Box::leak(lower.into_boxed_str())]);
+            } else if let Some(multi) = c.to_pinyin_multi() {
                 has_cjk = true;
-                initials.push(py.as_bytes()[0] as char);
-                full.push_str(py);
+                let options: Vec<&str> = multi.into_iter().map(|py| py.plain()).collect();
+                char_options.push(options);
+            } else {
+                // Unknown CJK char — skip
             }
         }
-        if has_cjk {
-            keys.push((KeyKind::Pinyin, Arc::from(full)));
-            keys.push((KeyKind::Initials, Arc::from(initials)));
-        }
-        if !path.starts_with("shell:") {
-            if let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str()) {
-                let stem_lower = stem.to_lowercase();
-                if stem_lower != name_lower
-                    && !keys
-                        .iter()
-                        .any(|(_, key)| key.as_ref() == stem_lower.as_str())
-                {
-                    keys.push((KeyKind::Alias, Arc::from(stem_lower)));
+
+        if has_cjk && !char_options.is_empty() {
+            // Generate Cartesian product of all pronunciation combinations,
+            // capped at MAX_COMBINATIONS to avoid explosion on long names.
+            const MAX_COMBINATIONS: usize = 16;
+            let mut combinations: Vec<(String, String)> =
+                vec![(String::new(), String::new())];
+
+            for options in char_options {
+                let mut next = Vec::new();
+                for (full, initials) in &combinations {
+                    for py in &options {
+                        let mut new_full = full.clone();
+                        let mut new_init = initials.clone();
+                        new_full.push_str(py);
+                        if let Some(first) = py.chars().next() {
+                            new_init.push(first);
+                        }
+                        next.push((new_full, new_init));
+                    }
                 }
+                next.truncate(MAX_COMBINATIONS);
+                combinations = next;
+            }
+
+            for (full, initials) in combinations {
+                if !full.is_empty()
+                    && !keys.iter().any(|(_, k)| k.as_ref() == full)
+                {
+                    keys.push((KeyKind::Pinyin, Arc::from(full)));
+                }
+                if !initials.is_empty()
+                    && !keys.iter().any(|(_, k)| k.as_ref() == initials)
+                {
+                    keys.push((KeyKind::Initials, Arc::from(initials)));
+                }
+            }
+        }
+
+        if !path.starts_with("shell:")
+            && let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str())
+        {
+            let stem_lower = stem.to_lowercase();
+            if stem_lower != name_lower
+                && !keys
+                    .iter()
+                    .any(|(_, key)| key.as_ref() == stem_lower.as_str())
+            {
+                keys.push((KeyKind::Alias, Arc::from(stem_lower)));
             }
         }
         let path_arc: Arc<str> = Arc::from(path);

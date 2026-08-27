@@ -4,7 +4,6 @@ pub mod app;
 pub mod config;
 pub mod domain;
 pub mod history;
-pub mod pinyin;
 pub mod plugins;
 pub mod renderer;
 pub mod router;
@@ -24,6 +23,9 @@ use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::*;
+use windows::Win32::UI::Input::Ime::{
+    GCS_COMPSTR, GCS_RESULTSTR, ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -424,6 +426,84 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
 
+        WM_IME_STARTCOMPOSITION => {
+            if let Some(app) = app_opt {
+                app.ime_comp.clear();
+                app.update_ime_position(hwnd);
+            }
+            LRESULT(0)
+        }
+
+        WM_IME_COMPOSITION => {
+            if let Some(app) = app_opt {
+                let himc = unsafe { ImmGetContext(hwnd) };
+                if !himc.0.is_null() {
+                    let lparam_u32 = lparam.0 as u32;
+
+                    if (lparam_u32 & GCS_RESULTSTR.0) != 0 {
+                        let len = unsafe { ImmGetCompositionStringW(himc, GCS_RESULTSTR, None, 0) };
+                        if len > 0 {
+                            let mut buf = vec![0u16; (len as usize) / 2];
+                            let _ = unsafe {
+                                ImmGetCompositionStringW(
+                                    himc,
+                                    GCS_RESULTSTR,
+                                    Some(buf.as_mut_ptr() as *mut _),
+                                    len as u32,
+                                )
+                            };
+                            let result_str = String::from_utf16_lossy(&buf);
+                            app.query.push_str(&result_str);
+                            app.ime_comp.clear();
+                            app.on_query_change(hwnd);
+                        }
+                    } else if (lparam_u32 & GCS_COMPSTR.0) != 0 {
+                        let len = unsafe { ImmGetCompositionStringW(himc, GCS_COMPSTR, None, 0) };
+                        if len > 0 {
+                            let mut buf = vec![0u16; (len as usize) / 2];
+                            let _ = unsafe {
+                                ImmGetCompositionStringW(
+                                    himc,
+                                    GCS_COMPSTR,
+                                    Some(buf.as_mut_ptr() as *mut _),
+                                    len as u32,
+                                )
+                            };
+                            app.ime_comp = String::from_utf16_lossy(&buf);
+                        } else {
+                            app.ime_comp.clear();
+                        }
+                        app.update_ime_position(hwnd);
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    }
+
+                    unsafe {
+                        let _ = ImmReleaseContext(hwnd, himc);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+
+        WM_IME_ENDCOMPOSITION => {
+            if let Some(app) = app_opt {
+                app.ime_comp.clear();
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            LRESULT(0)
+        }
+
+        WM_SETFOCUS => {
+            if let Some(app) = app_opt {
+                app.update_ime_position(hwnd);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
         WM_KILLFOCUS => {
             if let Some(app) = app_opt {
                 app.hide(hwnd);
@@ -568,6 +648,7 @@ unsafe fn toggle_window(hwnd: HWND) {
             if !ptr.is_null() {
                 let app = &mut *ptr;
                 app.query.clear();
+                app.ime_comp.clear();
                 app.results.clear();
                 app.selected = 0;
                 app.hovered = None;
@@ -589,7 +670,7 @@ unsafe fn toggle_window(hwnd: HWND) {
                 let items: Vec<&Item> = app.results.iter().collect();
                 let _ = app.renderer.render(
                     hwnd,
-                    &app.query,
+                    &app.display_query(),
                     &app.config.placeholder,
                     &items,
                     app.selected,
@@ -601,6 +682,12 @@ unsafe fn toggle_window(hwnd: HWND) {
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = SetForegroundWindow(hwnd);
             let _ = SetFocus(Some(hwnd));
+
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+            if !ptr.is_null() {
+                let app = &mut *ptr;
+                app.update_ime_position(hwnd);
+            }
         }
     }
 }

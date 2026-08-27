@@ -3,9 +3,12 @@ use crate::domain::Item;
 use crate::history::History;
 use crate::renderer::{Renderer, Spring, Theme, metrics, window_scale};
 use crate::router;
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+use windows::Win32::UI::Input::Ime::{
+    CFS_POINT, COMPOSITIONFORM, ImmGetContext, ImmReleaseContext, ImmSetCompositionWindow,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const TIMER_ANIMATION: usize = 2;
@@ -14,6 +17,7 @@ pub struct App {
     pub config: Config,
     pub index: Vec<Item>,
     pub query: String,
+    pub ime_comp: String,
     pub results: Vec<Item>,
     pub selected: usize,
     pub hovered: Option<usize>,
@@ -33,6 +37,7 @@ impl App {
             config,
             index: Vec::new(),
             query: String::new(),
+            ime_comp: String::new(),
             results: Vec::new(),
             selected: 0,
             hovered: None,
@@ -75,12 +80,56 @@ impl App {
         }
     }
 
+    pub fn display_query(&self) -> String {
+        if self.ime_comp.is_empty() {
+            self.query.clone()
+        } else {
+            format!("{}{}", self.query, self.ime_comp)
+        }
+    }
+
+    pub fn update_ime_position(&mut self, hwnd: HWND) {
+        unsafe {
+            let himc = ImmGetContext(hwnd);
+            if himc.0.is_null() {
+                return;
+            }
+
+            let s = window_scale(hwnd);
+            let input_clip_left = metrics::INPUT_X;
+            let input_clip_right = self.config.width as f32 - 24.0;
+            let max_visible_width = input_clip_right - input_clip_left;
+
+            let display_text = self.display_query();
+            let caret_offset_x = self.renderer.calculate_caret_offset(hwnd, &display_text);
+            let scroll_x = if caret_offset_x > max_visible_width {
+                caret_offset_x - max_visible_width
+            } else {
+                0.0
+            };
+
+            let final_caret_x = input_clip_left + caret_offset_x - scroll_x;
+            let pt_x = (final_caret_x * s).round() as i32;
+            let pt_y = ((metrics::HEADER_HEIGHT as f32 - 10.0) * s).round() as i32;
+
+            let form = COMPOSITIONFORM {
+                dwStyle: CFS_POINT,
+                ptCurrentPos: POINT { x: pt_x, y: pt_y },
+                rcArea: Default::default(),
+            };
+
+            let _ = ImmSetCompositionWindow(himc, &form);
+            let _ = ImmReleaseContext(hwnd, himc);
+        }
+    }
+
     pub fn on_query_change(&mut self, hwnd: HWND) {
         self.selected = 0;
         self.hovered = None;
         self.results = router::route_query(&self.query, &self.index, &self.history, &self.config);
         self.pill.reset(metrics::LIST_TOP);
         self.update_window_geometry(hwnd);
+        self.update_ime_position(hwnd);
     }
 
     pub fn move_selection_up(&mut self, hwnd: HWND) {
@@ -171,6 +220,8 @@ impl App {
 
     pub fn hide(&mut self, hwnd: HWND) {
         self.query.clear();
+        self.ime_comp.clear();
+        self.ime_comp.clear();
         self.results.clear();
         self.selected = 0;
         self.hovered = None;
@@ -218,10 +269,11 @@ impl App {
         } else {
             self.pill.current
         };
+        let display_text = self.display_query();
         unsafe {
             let _ = self.renderer.render(
                 hwnd,
-                &self.query,
+                &display_text,
                 &self.config.placeholder,
                 &items,
                 self.selected,
