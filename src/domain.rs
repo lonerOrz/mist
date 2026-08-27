@@ -330,10 +330,10 @@ impl Item {
     }
 
     pub fn new_command(raw_cmd: &str) -> Self {
-        let action_str: Arc<str> = if Path::new(raw_cmd).exists() {
+        let action_str: Arc<str> = if Path::new(raw_cmd).is_absolute() && Path::new(raw_cmd).exists() {
             Arc::from(raw_cmd)
         } else {
-            Arc::from(format!("cmd.exe /c {raw_cmd} || pause"))
+            Arc::from(format!("cmd.exe /k {raw_cmd}"))
         };
         Self {
             name: Arc::from(format!("Run command: {raw_cmd}")),
