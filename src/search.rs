@@ -134,8 +134,18 @@ mod tests {
 
     #[test]
     fn test_builtin_item_keys() {
-        let cfg = Item::new_config();
-        let exit = Item::new_exit();
+        let cfg = Item::new_app_mgmt(
+            "Open Config",
+            "config",
+            crate::domain::Action::OpenConfig,
+            &["configuration", "settings", "options"],
+        );
+        let exit = Item::new_app_mgmt(
+            "Exit Mist",
+            "exit",
+            crate::domain::Action::ExitApp,
+            &["quit", "close", ":q"],
+        );
 
         assert_eq!(match_item(&cfg, "conf", "conf", 0).unwrap().score, 1553);
         assert_eq!(

@@ -6,9 +6,20 @@ A lightweight Windows launcher written in Rust.
 
 - Application indexing from Start Menu, Desktop, UWP apps, PATH, and App Paths.
 - Sub-string, acronym, and Pinyin search with frecency scoring.
-- Built-in math expression evaluation.
-- Command execution with optional administrator privileges.
+- Plugin-based architecture with explicit prefix routing.
 - Direct2D rendering with acrylic backdrop and spring animations.
+
+## Prefixes & Plugins
+
+| Prefix   | Plugin     | Description                   | Example                       |
+| :------- | :--------- | :---------------------------- | :---------------------------- |
+| _(none)_ | App Search | Search installed applications | `code`, `微信`                |
+| `>`      | Command    | Execute shell commands        | `> ping baidu.com`            |
+| `?`      | Calculator | Evaluate math expressions     | `? 12 * (4 + 5)`              |
+| `!`      | Web Search | Search engines (Bang syntax)  | `!gh rust`, `!g ai`           |
+| `/sys`   | System     | System power operations       | `/sys lock`, `/sys shutdown`  |
+| `/app`   | App Mgmt   | Manage Mist itself            | `/app config`, `/app restart` |
+| _(auto)_ | Path       | Open file explorer            | `C:\Windows`                  |
 
 ## Shortcuts
 
@@ -24,13 +35,10 @@ A lightweight Windows launcher written in Rust.
 ## Build and Run
 
 ```bash
-cargo build --release
+cargo zigbuild --target x86_64-pc-windows-gnu
 ```
 
-Binary is output to `target/release/mist.exe`.
-
-- Start in background: `mist.exe`
-- Open window immediately: `mist.exe --show`
+Binary is output to `target/x86_64-pc-windows-gnu/release/mist.exe`
 
 ## License
 

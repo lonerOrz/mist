@@ -5,8 +5,9 @@ pub mod config;
 pub mod domain;
 pub mod history;
 pub mod pinyin;
-pub mod query;
+pub mod plugins;
 pub mod renderer;
+pub mod router;
 pub mod search;
 pub mod sources;
 
@@ -122,11 +123,6 @@ fn main() -> Result<()> {
     let config = Config::load_or_create();
     crate::config::sync_autostart(config.autostart);
 
-    let args: Vec<String> = std::env::args().collect();
-    let force_show = args
-        .iter()
-        .any(|arg| arg == "--show" || arg == "-s" || arg == "--test");
-
     let hwnd = unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
 
@@ -230,12 +226,6 @@ fn main() -> Result<()> {
             }
         }
     });
-
-    if force_show {
-        unsafe {
-            toggle_window(hwnd);
-        }
-    }
 
     unsafe {
         let mut msg = MSG::default();

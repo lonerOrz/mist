@@ -32,13 +32,14 @@ pub enum Action {
     RestartSystem,
     CopyText(Arc<str>),
     ExitApp,
+    OpenConfig,
+    RestartApp,
 }
 
 impl Action {
     pub fn execute(&self) {
         self.run(false);
     }
-
     pub fn execute_as_admin(&self) {
         self.run(true);
     }
@@ -64,9 +65,20 @@ impl Action {
                     .args(["/r", "/t", "0"])
                     .spawn();
             }
+            Action::OpenConfig => {
+                let path = config::get_config_path();
+                let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
+            }
+            Action::RestartApp => {
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(exe).spawn();
+                }
+                unsafe {
+                    PostQuitMessage(0);
+                }
+            }
             Action::Launch { path, verb } => {
                 let path_str = &**path;
-
                 unsafe {
                     let _ = AllowSetForegroundWindow(0xFFFFFFFF);
                 }
@@ -128,28 +140,23 @@ impl Action {
                     nShow: SW_SHOWNORMAL.0,
                     ..Default::default()
                 };
-
                 unsafe {
                     if let Err(e) = ShellExecuteExW(&mut exec_info) {
                         eprintln!("ShellExecuteExW failed: {e:?}, file: {file}");
                     }
                 }
             }
-            Action::CopyText(text) => {
-                set_clipboard(text);
-            }
+            Action::CopyText(text) => set_clipboard(text),
         }
     }
 }
 
 pub struct ClipboardGuard;
-
 impl ClipboardGuard {
     pub fn open() -> Option<Self> {
         unsafe { OpenClipboard(None).ok().map(|_| ClipboardGuard) }
     }
 }
-
 impl Drop for ClipboardGuard {
     fn drop(&mut self) {
         unsafe {
@@ -172,10 +179,7 @@ fn set_clipboard(text: &str) {
             if !ptr.is_null() {
                 std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, ptr as *mut u8, size);
                 let _ = GlobalUnlock(hmem);
-                let delivered = matches!(
-                    SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hmem.0))),
-                    Ok(h) if !h.0.is_null()
-                );
+                let delivered = matches!(SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hmem.0))), Ok(h) if !h.0.is_null());
                 if !delivered {
                     let _ = GlobalFree(Some(hmem));
                 }
@@ -214,10 +218,10 @@ pub enum ItemKind {
     Application,
     Calculator { result: Arc<str> },
     Command { raw: Arc<str> },
-    Config,
-    Exit,
     Web,
     Path,
+    System,
+    AppMgmt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,7 +247,6 @@ impl Item {
         let name_lower = name.to_lowercase();
         let mut keys: Vec<(KeyKind, Arc<str>)> =
             vec![(KeyKind::Name, Arc::from(name_lower.as_str()))];
-
         let mut initials = String::with_capacity(name.len());
         let mut full = String::with_capacity(name.len() * 4);
         let mut has_cjk = false;
@@ -262,20 +265,18 @@ impl Item {
             keys.push((KeyKind::Pinyin, Arc::from(full)));
             keys.push((KeyKind::Initials, Arc::from(initials)));
         }
-
-        if !path.starts_with("shell:")
-            && let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str())
-        {
-            let stem_lower = stem.to_lowercase();
-            if stem_lower != name_lower
-                && !keys
-                    .iter()
-                    .any(|(_, key)| key.as_ref() == stem_lower.as_str())
-            {
-                keys.push((KeyKind::Alias, Arc::from(stem_lower)));
+        if !path.starts_with("shell:") {
+            if let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str()) {
+                let stem_lower = stem.to_lowercase();
+                if stem_lower != name_lower
+                    && !keys
+                        .iter()
+                        .any(|(_, key)| key.as_ref() == stem_lower.as_str())
+                {
+                    keys.push((KeyKind::Alias, Arc::from(stem_lower)));
+                }
             }
         }
-
         let path_arc: Arc<str> = Arc::from(path);
         Self {
             name: Arc::from(name),
@@ -325,45 +326,33 @@ impl Item {
         }
     }
 
-    pub fn new_config() -> Self {
-        let cfg_path = config::get_config_path();
-        let path_str = cfg_path.to_string_lossy().to_string();
-        let path_arc: Arc<str> = Arc::from(path_str.as_str());
+    pub fn new_system(name: &str, cmd: &str, action: Action, aliases: &[&str]) -> Self {
+        let mut keys = vec![(KeyKind::Name, Arc::from(cmd))];
+        for alias in aliases {
+            keys.push((KeyKind::Alias, Arc::from(*alias)));
+        }
         Self {
-            name: Arc::from("Open Config (config.toml)"),
-            keys: vec![
-                (KeyKind::Name, Arc::from("config")),
-                (KeyKind::Alias, Arc::from("configuration")),
-                (KeyKind::Alias, Arc::from("settings")),
-                (KeyKind::Alias, Arc::from("preference")),
-                (KeyKind::Alias, Arc::from("options")),
-            ]
-            .into_boxed_slice(),
-            path: path_arc.clone(),
-            kind: ItemKind::Config,
+            name: Arc::from(name),
+            path: Arc::from(cmd),
+            kind: ItemKind::System,
             priority_penalty: 0,
-            action: Action::Launch {
-                path: path_arc,
-                verb: None,
-            },
+            action,
+            keys: keys.into_boxed_slice(),
         }
     }
 
-    pub fn new_exit() -> Self {
+    pub fn new_app_mgmt(name: &str, cmd: &str, action: Action, aliases: &[&str]) -> Self {
+        let mut keys = vec![(KeyKind::Name, Arc::from(cmd))];
+        for alias in aliases {
+            keys.push((KeyKind::Alias, Arc::from(*alias)));
+        }
         Self {
-            name: Arc::from("Exit Mist"),
-            keys: vec![
-                (KeyKind::Name, Arc::from("exit")),
-                (KeyKind::Alias, Arc::from("mist")),
-                (KeyKind::Alias, Arc::from("quit")),
-                (KeyKind::Alias, Arc::from("close")),
-                (KeyKind::Alias, Arc::from(":q")),
-            ]
-            .into_boxed_slice(),
-            path: Arc::from("Quit the launcher process"),
-            kind: ItemKind::Exit,
+            name: Arc::from(name),
+            path: Arc::from(cmd),
+            kind: ItemKind::AppMgmt,
             priority_penalty: 0,
-            action: Action::ExitApp,
+            action,
+            keys: keys.into_boxed_slice(),
         }
     }
 

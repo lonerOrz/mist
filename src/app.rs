@@ -1,8 +1,8 @@
 use crate::config::Config;
 use crate::domain::Item;
 use crate::history::History;
-use crate::query::QueryPipeline;
 use crate::renderer::{Renderer, Spring, Theme, metrics, window_scale};
+use crate::router;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
@@ -45,8 +45,7 @@ impl App {
         }
     }
 
-    pub fn set_index(&mut self, mut items: Vec<Item>) {
-        items.extend(crate::sources::system::builtins());
+    pub fn set_index(&mut self, items: Vec<Item>) {
         self.index = items;
     }
 
@@ -79,8 +78,7 @@ impl App {
     pub fn on_query_change(&mut self, hwnd: HWND) {
         self.selected = 0;
         self.hovered = None;
-
-        self.results = QueryPipeline::query(&self.query, &self.index, &self.history, &self.config);
+        self.results = router::route_query(&self.query, &self.index, &self.history, &self.config);
         self.pill.reset(metrics::LIST_TOP);
         self.update_window_geometry(hwnd);
     }
@@ -134,24 +132,16 @@ impl App {
         if idx < self.results.len() {
             self.selected = idx;
             self.pill.set_target(list_item_top(idx));
-
             let item = &self.results[idx];
             let is_calc = matches!(item.kind, crate::domain::ItemKind::Calculator { .. });
-            let is_cfg = matches!(item.kind, crate::domain::ItemKind::Config);
-            let is_exit = matches!(item.kind, crate::domain::ItemKind::Exit);
+            let is_mgmt = matches!(item.kind, crate::domain::ItemKind::AppMgmt);
+
             let admin_min_x = (self.config.width - metrics::ADMIN_ZONE_FAR) as f32;
             let admin_max_x = (self.config.width - metrics::ADMIN_ZONE_NEAR) as f32;
-
             let row_top = list_item_top(idx);
             let in_admin_button = y >= row_top + 13.5 && y <= row_top + 36.5;
 
-            if !is_calc
-                && !is_cfg
-                && !is_exit
-                && in_admin_button
-                && x >= admin_min_x
-                && x <= admin_max_x
-            {
+            if !is_calc && !is_mgmt && in_admin_button && x >= admin_min_x && x <= admin_max_x {
                 self.execute_selected_admin(hwnd);
             } else {
                 self.execute_selected(hwnd);
@@ -187,7 +177,6 @@ impl App {
         self.height_spring.reset(metrics::HEADER_HEIGHT as f32);
         self.pill.reset(metrics::LIST_TOP);
         self.spring_animating = false;
-
         unsafe {
             let s = window_scale(hwnd);
             let _ = SetWindowPos(
@@ -200,7 +189,6 @@ impl App {
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
             );
             let _ = ShowWindow(hwnd, SW_HIDE);
-
             let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
         }
     }
@@ -209,7 +197,6 @@ impl App {
         let pill_moving = !self.results.is_empty() && self.pill.update(1.0 / 60.0);
         let height_moving = self.height_spring.update(1.0 / 60.0);
         self.spring_animating = pill_moving || height_moving;
-
         if height_moving {
             let h = self.height_spring.current.round() as i32;
             let s = window_scale(hwnd);
@@ -225,7 +212,6 @@ impl App {
                 );
             }
         }
-
         let items: Vec<&Item> = self.results.iter().collect();
         let pill_y = if self.results.is_empty() {
             metrics::LIST_TOP

@@ -1,18 +1,20 @@
 use crate::domain::{Action, Item, ItemKind};
 use std::sync::Arc;
 
-pub fn evaluate(q: &str) -> Option<Item> {
+pub fn is_path(q: &str) -> bool {
     let b = q.as_bytes();
-    let looks_path = b.len() >= 3
+    b.len() >= 3
         && ((b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\')
             || q.starts_with(r"\\")
-            || q.starts_with("//"));
-    if !looks_path {
-        return None;
-    }
+            || q.starts_with("//"))
+}
 
-    let path: Arc<str> = Arc::from(q);
-    Some(Item {
+pub fn query(args: &str) -> Vec<Item> {
+    if !is_path(args) {
+        return Vec::new();
+    }
+    let path: Arc<str> = Arc::from(args);
+    vec![Item {
         name: Arc::from("Open Folder"),
         path: path.clone(),
         kind: ItemKind::Path,
@@ -22,5 +24,5 @@ pub fn evaluate(q: &str) -> Option<Item> {
             verb: Some("explore"),
         },
         keys: Box::new([]),
-    })
+    }]
 }

@@ -59,17 +59,17 @@ const ICON_CMD: BadgeGlyphs = BadgeGlyphs {
     nerd: w!("\u{f120}"),
     fluent: w!("\u{e756}"),
 };
-const ICON_CFG: BadgeGlyphs = BadgeGlyphs {
+const ICON_SYS: BadgeGlyphs = BadgeGlyphs {
+    nerd: w!("\u{f2db}"),
+    fluent: w!("\u{e7ba}"),
+};
+const ICON_APP_MGMT: BadgeGlyphs = BadgeGlyphs {
     nerd: w!("\u{f013}"),
     fluent: w!("\u{e713}"),
 };
 const ICON_APP: BadgeGlyphs = BadgeGlyphs {
     nerd: w!("\u{f009}"),
     fluent: w!("\u{e71d}"),
-};
-const ICON_EXIT: BadgeGlyphs = BadgeGlyphs {
-    nerd: w!("\u{f011}"),
-    fluent: w!("\u{e7e8}"),
 };
 const ICON_WEB: BadgeGlyphs = BadgeGlyphs {
     nerd: w!("\u{f0ac}"),
@@ -90,10 +90,7 @@ fn pick_glyph(g: &BadgeGlyphs, is_nerd: bool) -> &[u16] {
     }
 }
 const KEY_CAP_COPY: PCWSTR = w!("↵ Copy");
-const KEY_CAP_RUN: PCWSTR = w!("↵ Run");
 const KEY_CAP_OPEN: PCWSTR = w!("↵ Open");
-const KEY_CAP_EDIT: PCWSTR = w!("↵ Edit");
-const KEY_CAP_EXIT: PCWSTR = w!("↵ Exit");
 const KEY_CAP_ADMIN: PCWSTR = w!("Shift+↵ Admin");
 
 pub fn window_scale(hwnd: HWND) -> f32 {
@@ -860,9 +857,7 @@ impl Renderer {
                 }
 
                 let is_calc = matches!(item.kind, ItemKind::Calculator { .. });
-                let is_cmd = matches!(item.kind, ItemKind::Command { .. });
-                let is_cfg = matches!(item.kind, ItemKind::Config);
-                let is_exit = matches!(item.kind, ItemKind::Exit);
+                let is_mgmt = matches!(item.kind, ItemKind::AppMgmt);
 
                 let icon_container = D2D_RECT_F {
                     left: 20.0,
@@ -874,7 +869,7 @@ impl Renderer {
                 let badge_fmt = &ctx.formats.badge;
 
                 match &item.kind {
-                    ItemKind::Config => draw_badge(
+                    ItemKind::AppMgmt => draw_badge(
                         &target,
                         &dwrite_factory,
                         icon_fmt,
@@ -882,11 +877,11 @@ impl Renderer {
                         theme.badge_radius,
                         &ctx.brushes.accent_subtle,
                         &ctx.brushes.accent_border,
-                        pick_glyph(&ICON_CFG, is_nerd_font),
+                        pick_glyph(&ICON_APP_MGMT, is_nerd_font),
                         &ctx.brushes.accent,
                         is_nerd_font,
                     ),
-                    ItemKind::Exit => draw_badge(
+                    ItemKind::System => draw_badge(
                         &target,
                         &dwrite_factory,
                         icon_fmt,
@@ -894,8 +889,8 @@ impl Renderer {
                         theme.badge_radius,
                         &ctx.brushes.badge_bg,
                         &ctx.brushes.border,
-                        pick_glyph(&ICON_EXIT, is_nerd_font),
-                        &ctx.brushes.text,
+                        pick_glyph(&ICON_SYS, is_nerd_font),
+                        &ctx.brushes.subtext,
                         is_nerd_font,
                     ),
                     ItemKind::Calculator { .. } => draw_badge(
@@ -976,10 +971,8 @@ impl Renderer {
                 let text_max_right = size.width as f32 - 185.0;
 
                 let title_w = to_wide_slice(&item.name);
-                let title_brush = if is_calc || is_cfg {
+                let title_brush = if is_calc {
                     &ctx.brushes.accent
-                } else if is_cmd {
-                    &ctx.brushes.admin_badge
                 } else {
                     &ctx.brushes.text
                 };
@@ -1015,12 +1008,8 @@ impl Renderer {
                 if i == selected {
                     let action_str = if is_calc {
                         KEY_CAP_COPY
-                    } else if is_cmd {
-                        KEY_CAP_RUN
-                    } else if is_cfg {
-                        KEY_CAP_EDIT
-                    } else if is_exit {
-                        KEY_CAP_EXIT
+                    } else if is_mgmt {
+                        KEY_CAP_OPEN
                     } else {
                         KEY_CAP_OPEN
                     };
@@ -1046,7 +1035,7 @@ impl Renderer {
                         DWRITE_MEASURING_MODE_NATURAL,
                     );
 
-                    if !is_calc && !is_exit && !is_cfg {
+                    if !is_calc && !is_mgmt {
                         let admin_w = KEY_CAP_ADMIN.as_wide();
                         let admin_rect = D2D1_ROUNDED_RECT {
                             rect: D2D_RECT_F {
