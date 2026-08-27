@@ -155,7 +155,13 @@ impl Action {
 pub struct ClipboardGuard;
 impl ClipboardGuard {
     pub fn open() -> Option<Self> {
-        unsafe { OpenClipboard(None).ok().map(|_| ClipboardGuard) }
+        for _ in 0..5 {
+            if unsafe { OpenClipboard(None).is_ok() } {
+                return Some(ClipboardGuard);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        None
     }
 }
 impl Drop for ClipboardGuard {
@@ -246,11 +252,12 @@ pub struct Item {
 impl Item {
     pub fn new_application(name: &str, path: &str) -> Self {
         let name_lower = name.to_lowercase();
-        let mut keys: Vec<(KeyKind, Arc<str>)> =
-            vec![(KeyKind::Name, Arc::from(name_lower.as_str()))];
+        // 预分配容量，常见应用拥有 Name, Pinyin, Initials, Alias 约 4 项
+        let mut keys: Vec<(KeyKind, Arc<str>)> = Vec::with_capacity(4);
+        keys.push((KeyKind::Name, Arc::from(name_lower.as_str())));
 
-        let mut pinyin_full = String::new();
-        let mut pinyin_initials = String::new();
+        let mut pinyin_full = String::with_capacity(name.len() * 4);
+        let mut pinyin_initials = String::with_capacity(name.len());
         let mut has_cjk = false;
 
         for c in name.chars() {
