@@ -2,6 +2,7 @@ use crate::config;
 use pinyin::ToPinyinMulti;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::DataExchange::*;
 use windows::Win32::System::Memory::*;
@@ -28,6 +29,8 @@ pub enum Action {
     ShutdownSystem,
     RestartSystem,
     CopyText(Arc<str>),
+    PasteText(Arc<str>),
+    PasteFiles(Arc<[std::path::PathBuf]>),
     ExitApp,
     OpenConfig,
     RestartApp,
@@ -148,6 +151,16 @@ impl Action {
                 }
             }
             Action::CopyText(text) => set_clipboard(text),
+            Action::PasteText(text) => {
+                crate::clipboard::IS_INTERNAL_COPY.store(true, Ordering::SeqCst);
+                set_clipboard(text);
+                std::thread::spawn(simulate_paste);
+            }
+            Action::PasteFiles(paths) => {
+                crate::clipboard::IS_INTERNAL_COPY.store(true, Ordering::SeqCst);
+                set_clipboard_files(paths);
+                std::thread::spawn(simulate_paste);
+            }
         }
     }
 }
@@ -229,6 +242,7 @@ pub enum ItemKind {
     Path,
     System,
     AppMgmt,
+    Clipboard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,7 +266,7 @@ pub struct Item {
 impl Item {
     pub fn new_application(name: &str, path: &str) -> Self {
         let name_lower = name.to_lowercase();
-        // 预分配容量，常见应用拥有 Name, Pinyin, Initials, Alias 约 4 项
+        // preallocate: typical apps have ~4 keys (Name, Pinyin, Initials, Alias)
         let mut keys: Vec<(KeyKind, Arc<str>)> = Vec::with_capacity(4);
         keys.push((KeyKind::Name, Arc::from(name_lower.as_str())));
 
@@ -398,4 +412,85 @@ impl Item {
 pub struct Match<'a> {
     pub item: &'a Item,
     pub score: i32,
+}
+
+pub fn simulate_paste() {
+    std::thread::sleep(std::time::Duration::from_millis(45));
+
+    unsafe {
+        use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        let inputs = [
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VK_CONTROL,
+                        ..Default::default()
+                    },
+                },
+            },
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VK_V,
+                        ..Default::default()
+                    },
+                },
+            },
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VK_V,
+                        dwFlags: KEYEVENTF_KEYUP,
+                        ..Default::default()
+                    },
+                },
+            },
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VK_CONTROL,
+                        dwFlags: KEYEVENTF_KEYUP,
+                        ..Default::default()
+                    },
+                },
+            },
+        ];
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+pub fn set_clipboard_files(paths: &[std::path::PathBuf]) {
+    let _guard = match ClipboardGuard::open() {
+        Some(g) => g,
+        None => return,
+    };
+    unsafe {
+        let _ = EmptyClipboard();
+        let mut total_wchars = Vec::new();
+        for p in paths {
+            total_wchars.extend(to_wide(&p.to_string_lossy()));
+        }
+        total_wchars.push(0);
+
+        let dropfiles_size = std::mem::size_of::<windows::Win32::UI::Shell::DROPFILES>();
+        let total_bytes = dropfiles_size + total_wchars.len() * 2;
+
+        if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, total_bytes) {
+            let ptr = GlobalLock(hmem);
+            if !ptr.is_null() {
+                let df = ptr as *mut windows::Win32::UI::Shell::DROPFILES;
+                (*df).pFiles = dropfiles_size as u32;
+                (*df).fWide = BOOL(1);
+
+                let dest = (ptr as *mut u8).add(dropfiles_size) as *mut u16;
+                std::ptr::copy_nonoverlapping(total_wchars.as_ptr(), dest, total_wchars.len());
+                let _ = GlobalUnlock(hmem);
+                let _ = SetClipboardData(CF_HDROP.0 as u32, Some(HANDLE(hmem.0)));
+            }
+        }
+    }
 }

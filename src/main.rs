@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 pub mod app;
+pub mod clipboard;
 pub mod config;
 pub mod domain;
 pub mod history;
@@ -20,6 +21,9 @@ use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint};
 use windows::Win32::System::Com::*;
+use windows::Win32::System::DataExchange::{
+    AddClipboardFormatListener, RemoveClipboardFormatListener,
+};
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Controls::MARGINS;
@@ -30,7 +34,6 @@ use windows::Win32::UI::Input::Ime::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT};
-use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
@@ -311,6 +314,14 @@ unsafe extern "system" fn wnd_proc(
                 let blink = GetCaretBlinkTime();
                 let blink = if blink == 0 { 500 } else { blink };
                 let _ = SetTimer(Some(hwnd), TIMER_CARET, blink, None);
+                let _ = AddClipboardFormatListener(hwnd);
+            }
+            LRESULT(0)
+        }
+
+        WM_CLIPBOARDUPDATE => {
+            if let Some(app) = app_opt {
+                app.clipboard_listener.notify_update();
             }
             LRESULT(0)
         }
@@ -610,6 +621,14 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
 
+        WM_MOUSEWHEEL => {
+            if let Some(app) = app_opt {
+                let delta = ((wparam.0 >> 16) & 0xffff) as i16;
+                app.on_mouse_wheel(hwnd, delta);
+            }
+            LRESULT(0)
+        }
+
         WM_PAINT => {
             if let Some(app) = app_opt {
                 app.render_current_frame(hwnd);
@@ -648,6 +667,7 @@ unsafe extern "system" fn wnd_proc(
                 let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
                 let _ = KillTimer(Some(hwnd), TIMER_CARET);
                 let _ = KillTimer(Some(hwnd), TIMER_ANIMATION);
+                let _ = RemoveClipboardFormatListener(hwnd);
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
                 if !ptr.is_null() {
                     drop(Box::from_raw(ptr));
@@ -705,6 +725,7 @@ unsafe fn toggle_window(hwnd: HWND) {
                 app.caret_visible = true;
                 app.height_spring.reset(metrics::HEADER_HEIGHT as f32);
                 app.pill.reset(metrics::LIST_TOP);
+                app.scroll_spring.reset(0.0);
 
                 let blink = GetCaretBlinkTime();
                 let blink = if blink == 0 { 500 } else { blink };
@@ -739,6 +760,8 @@ unsafe fn toggle_window(hwnd: HWND) {
                     app.caret_visible,
                     app.hovered,
                     app.pill.current,
+                    app.config.max_results,
+                    app.scroll_spring.current,
                 );
             }
             let _ = ShowWindow(hwnd, SW_SHOW);

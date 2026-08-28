@@ -1,3 +1,4 @@
+use crate::clipboard::ClipboardEntry;
 use crate::config::Config;
 use crate::domain::Item;
 use crate::history::History;
@@ -16,6 +17,7 @@ fn get_plugins() -> &'static [Box<dyn Plugin>] {
             Box::new(plugins::sys::SysPlugin),
             Box::new(plugins::app_mgmt::AppMgmtPlugin),
             Box::new(plugins::web::WebPlugin),
+            Box::new(plugins::clip::ClipPlugin),
             Box::new(plugins::path::PathPlugin),
         ]
     })
@@ -26,6 +28,7 @@ pub fn route_query(
     index: &[Item],
     history: &History,
     config: &Config,
+    clipboard_history: &[ClipboardEntry],
 ) -> Vec<Item> {
     let q = raw_query.trim();
     if q.is_empty() {
@@ -36,6 +39,7 @@ pub fn route_query(
         index,
         history,
         config,
+        clipboard_history,
     };
 
     for plugin in get_plugins() {
@@ -44,16 +48,11 @@ pub fn route_query(
         }
     }
 
-    search_top_k(index, q, history, config.max_results)
+    search_top_k(index, q, history)
 }
 
-pub fn search_top_k(
-    index: &[Item],
-    query: &str,
-    history: &History,
-    max_results: usize,
-) -> Vec<Item> {
-    if max_results == 0 || index.is_empty() {
+pub fn search_top_k(index: &[Item], query: &str, history: &History) -> Vec<Item> {
+    if index.is_empty() {
         return Vec::new();
     }
 
@@ -71,7 +70,7 @@ pub fn search_top_k(
         return Vec::new();
     }
 
-    let k = max_results.min(scored.len());
+    let k = scored.len().min(500);
     if k == 0 {
         return Vec::new();
     }

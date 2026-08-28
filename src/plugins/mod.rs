@@ -1,10 +1,12 @@
 pub mod app_mgmt;
 pub mod calc;
+pub mod clip;
 pub mod cmd;
 pub mod path;
 pub mod sys;
 pub mod web;
 
+use crate::clipboard::ClipboardEntry;
 use crate::config::Config;
 use crate::domain::Item;
 use crate::history::History;
@@ -13,6 +15,7 @@ pub struct PluginContext<'a> {
     pub index: &'a [Item],
     pub history: &'a History,
     pub config: &'a Config,
+    pub clipboard_history: &'a [ClipboardEntry],
 }
 
 pub trait Plugin: Send + Sync {

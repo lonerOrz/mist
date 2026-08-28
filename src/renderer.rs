@@ -22,6 +22,8 @@ pub mod metrics {
     pub const INPUT_X: f32 = 48.0;
     pub const ADMIN_ZONE_FAR: i32 = 176;
     pub const ADMIN_ZONE_NEAR: i32 = 82;
+    pub const SCROLLBAR_WIDTH: f32 = 3.0;
+    pub const SCROLLBAR_MARGIN_RIGHT: f32 = 4.0;
 
     #[inline]
     pub fn list_item_top(idx: usize) -> f32 {
@@ -94,6 +96,10 @@ const ICON_PATH: BadgeGlyphs = BadgeGlyphs {
     nerd: w!("\u{f07b}"),
     fluent: w!("\u{e8b7}"),
 };
+const ICON_CLIP: BadgeGlyphs = BadgeGlyphs {
+    nerd: w!("\u{f0ea}"),
+    fluent: w!("\u{e77f}"),
+};
 
 fn pick_glyph(g: &BadgeGlyphs, is_nerd: bool) -> &[u16] {
     unsafe {
@@ -105,6 +111,7 @@ fn pick_glyph(g: &BadgeGlyphs, is_nerd: bool) -> &[u16] {
     }
 }
 const KEY_CAP_COPY: PCWSTR = w!("↵ Copy");
+const KEY_CAP_PASTE: PCWSTR = w!("↵ Paste");
 const KEY_CAP_OPEN: PCWSTR = w!("↵ Open");
 const KEY_CAP_ADMIN: PCWSTR = w!("Shift+↵ Admin");
 
@@ -241,7 +248,7 @@ impl IconCache {
         self.loading.remove(&key);
         self.cache.insert(key, (loaded.clone(), current_tick));
 
-        // 真实 LRU 淘汰：当缓存超过 512 个时，按访问时间戳顺序精确剔除最旧的 256 个项
+        // real LRU eviction: once cache exceeds 512, evict the 256 oldest by access tick
         if self.cache.len() > 512 {
             let mut entries: Vec<(Arc<str>, u64)> = self
                 .cache
@@ -755,6 +762,8 @@ impl Renderer {
         caret_visible: bool,
         hovered: Option<usize>,
         pill_y: f32,
+        max_results: usize,
+        scroll_y: f32,
     ) -> Result<()> {
         unsafe {
             self.ensure_context(hwnd)?;
@@ -912,15 +921,33 @@ impl Renderer {
             }
 
             let start_y = metrics::LIST_TOP;
-            let item_h = metrics::ITEM_HEIGHT as f32;
 
-            if !items.is_empty() {
+            // Viewport clipping: prevent items from bleeding into the header or outside rounded corners
+            let clip_top = start_y + 0.5;
+            let clip_bottom = dip_size.height - 0.5;
+            let clip_rect = D2D_RECT_F {
+                left: 0.0,
+                top: clip_top,
+                right: dip_size.width,
+                bottom: clip_bottom,
+            };
+            target.PushAxisAlignedClip(&clip_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+            // Compute floating-point visible range for smooth sub-pixel scrolling
+            let item_h = metrics::ITEM_HEIGHT as f32;
+            let first_idx = (scroll_y / item_h).floor() as usize;
+            // Overdraw: render 2 extra rows so sub-pixel scrolling never reveals a blank edge;
+            // the viewport clip culls the overflow. Pill is in absolute list coords, so minus scroll.
+            let visual_pill_y = pill_y - scroll_y;
+            let last_idx = (first_idx + max_results + 2).min(items.len());
+
+            if last_idx > first_idx {
                 let pill_rect = D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
                         left: 8.0,
-                        top: pill_y,
+                        top: visual_pill_y,
                         right: dip_size.width - 8.0,
-                        bottom: pill_y + item_h - 4.0,
+                        bottom: visual_pill_y + item_h - 4.0,
                     },
                     radiusX: theme.pill_radius,
                     radiusY: theme.pill_radius,
@@ -929,8 +956,14 @@ impl Renderer {
                 target.DrawRoundedRectangle(&pill_rect, &ctx.brushes.selection_border, 1.0, None);
             }
 
-            for (i, item) in items.iter().enumerate() {
-                let top = start_y + (i as f32) * item_h;
+            for (global_i, &item) in items
+                .iter()
+                .enumerate()
+                .skip(first_idx)
+                .take(last_idx - first_idx)
+            {
+                // Sub-pixel: use float global index directly, clip region handles frustum culling
+                let top = start_y + (global_i as f32) * item_h - scroll_y;
                 let bottom = top + item_h - 4.0;
 
                 let item_rect = D2D1_ROUNDED_RECT {
@@ -944,7 +977,7 @@ impl Renderer {
                     radiusY: theme.pill_radius,
                 };
 
-                if Some(i) == hovered && i != selected {
+                if Some(global_i) == hovered && global_i != selected {
                     target.FillRoundedRectangle(&item_rect, &ctx.brushes.hover);
                 }
 
@@ -1033,6 +1066,18 @@ impl Renderer {
                         &ctx.brushes.subtext,
                         is_nerd_font,
                     ),
+                    ItemKind::Clipboard => draw_badge(
+                        &target,
+                        &dwrite_factory,
+                        icon_fmt,
+                        &icon_container,
+                        theme.badge_radius,
+                        &ctx.brushes.accent_subtle,
+                        &ctx.brushes.accent_border,
+                        pick_glyph(&ICON_CLIP, is_nerd_font),
+                        &ctx.brushes.accent,
+                        is_nerd_font,
+                    ),
                     ItemKind::Application => {
                         let icon_bmp = icon_cache.get_or_load(&target, &item.path, icon_px);
                         if let Some(bmp) = icon_bmp {
@@ -1097,8 +1142,14 @@ impl Renderer {
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
 
-                if i == selected {
-                    let action_str = if is_calc { KEY_CAP_COPY } else { KEY_CAP_OPEN };
+                if global_i == selected {
+                    let action_str = if is_calc {
+                        KEY_CAP_COPY
+                    } else if matches!(item.kind, ItemKind::Clipboard) {
+                        KEY_CAP_PASTE
+                    } else {
+                        KEY_CAP_OPEN
+                    };
 
                     let action_rect = D2D1_ROUNDED_RECT {
                         rect: D2D_RECT_F {
@@ -1151,6 +1202,34 @@ impl Renderer {
                     }
                 }
             }
+
+            // Scrollbar indicator
+            if items.len() > max_results && max_results > 0 {
+                let track_top = start_y + 4.0;
+                let list_h = (max_results as f32) * item_h + 8.0;
+                let track_bottom = start_y + list_h - 4.0;
+                let track_h = track_bottom - track_top;
+                let total_h = (items.len() as f32) * item_h;
+                let max_scroll = (total_h - list_h + 8.0).max(1.0);
+                let thumb_h = (track_h * (list_h / total_h)).clamp(16.0, track_h);
+                let thumb_y =
+                    track_top + (track_h - thumb_h) * (scroll_y / max_scroll).clamp(0.0, 1.0);
+                let sb_x =
+                    dip_size.width - metrics::SCROLLBAR_MARGIN_RIGHT - metrics::SCROLLBAR_WIDTH;
+                let thumb_rect = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: sb_x,
+                        top: thumb_y,
+                        right: sb_x + metrics::SCROLLBAR_WIDTH,
+                        bottom: thumb_y + thumb_h,
+                    },
+                    radiusX: 1.5,
+                    radiusY: 1.5,
+                };
+                target.FillRoundedRectangle(&thumb_rect, &ctx.brushes.badge_border);
+            }
+
+            target.PopAxisAlignedClip();
 
             if target.EndDraw(None, None).is_err() {
                 self.context = None;
