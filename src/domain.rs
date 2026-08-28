@@ -270,42 +270,44 @@ impl Item {
         let mut keys: Vec<(KeyKind, Arc<str>)> = Vec::with_capacity(4);
         keys.push((KeyKind::Name, Arc::from(name_lower.as_str())));
 
-        let mut pinyin_full = String::with_capacity(name.len() * 4);
-        let mut pinyin_initials = String::with_capacity(name.len());
+        // Build pinyin index (no spaces) and initials in correct order.
+        let mut pinyin_joined = String::with_capacity(name.len() * 4);
+        let mut initials_chars: Vec<char> = Vec::with_capacity(name.len());
         let mut has_cjk = false;
+        let mut prev_is_alphanumeric = false;
 
         for c in name.chars() {
             if c.is_ascii_alphanumeric() {
                 let lower = c.to_ascii_lowercase();
-                pinyin_full.push(lower);
-                pinyin_initials.push(lower);
+                pinyin_joined.push(lower);
+                if !prev_is_alphanumeric {
+                    // Only take the first letter of each ASCII word
+                    initials_chars.push(lower);
+                }
+                prev_is_alphanumeric = true;
             } else if let Some(multi) = c.to_pinyin_multi() {
                 has_cjk = true;
-                let mut char_pinyins = Vec::new();
-                let mut char_initials = Vec::new();
-                for py in multi {
-                    let plain = py.plain();
-                    char_pinyins.push(plain.to_string());
-                    if let Some(first) = plain.chars().next() {
-                        char_initials.push(first);
+                prev_is_alphanumeric = false;
+                if let Some(first_py) = multi.into_iter().next() {
+                    let plain = first_py.plain();
+                    pinyin_joined.push_str(plain);
+                    if let Some(first_char) = plain.chars().next() {
+                        initials_chars.push(first_char);
                     }
                 }
-                pinyin_full.push_str(&char_pinyins.join(" "));
-                pinyin_full.push(' ');
-                char_initials.sort();
-                char_initials.dedup();
-                pinyin_initials.push_str(&char_initials.iter().collect::<String>());
-                pinyin_initials.push(' ');
+            } else {
+                prev_is_alphanumeric = false;
             }
         }
 
-        if has_cjk {
-            if !pinyin_full.is_empty() {
-                keys.push((KeyKind::Pinyin, Arc::from(pinyin_full.trim_end())));
-            }
-            if !pinyin_initials.is_empty() {
-                keys.push((KeyKind::Initials, Arc::from(pinyin_initials)));
-            }
+        if has_cjk && !pinyin_joined.is_empty() {
+            // Store pinyin without spaces for zero-allocation search
+            keys.push((KeyKind::Pinyin, Arc::from(pinyin_joined.as_str())));
+        }
+
+        let initials_str: String = initials_chars.into_iter().collect();
+        if initials_str.len() >= 2 && initials_str != name_lower {
+            keys.push((KeyKind::Initials, Arc::from(initials_str.as_str())));
         }
 
         if !path.starts_with("shell:")

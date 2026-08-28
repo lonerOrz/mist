@@ -127,7 +127,8 @@ impl History {
                 20
             };
 
-            ((rec.count as i32) * multiplier).min(800)
+            // Cap at 250 so frecency can never cross a tier boundary (minimum gap = 200)
+            ((rec.count as i32) * multiplier).min(250)
         } else {
             0
         }

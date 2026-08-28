@@ -69,7 +69,7 @@ pub fn query(args: &str) -> Vec<Item> {
         let url_arc: Arc<str> = Arc::from(trimmed);
         return vec![Item {
             name: Arc::from(format!("Open URL: {trimmed}")),
-            path: Arc::from("Open in default browser"),
+            path: url_arc.clone(),
             kind: ItemKind::Web,
             priority_penalty: 0,
             action: Action::Launch {

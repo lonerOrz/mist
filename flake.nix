@@ -41,14 +41,19 @@
 
     in
     {
-      devShells.${system}.default = pkgs.mkShell {
-
-        packages = with pkgs; [
+      devShells.${system}.default = pkgs.pkgsCross.mingwW64.mkShell {
+        nativeBuildInputs = [
           rustToolchain
-          zig
-          cargo-zigbuild
-          pkgsCross.mingwW64.stdenv.cc
+          pkgs.zig
+          pkgs.cargo-zigbuild
         ];
+
+        buildInputs = [
+          pkgs.pkgsCross.mingwW64.windows.pthreads
+        ];
+
+        CARGO_BUILD_TARGET = "x86_64-pc-windows-gnu";
+        CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-L native=${pkgs.pkgsCross.mingwW64.windows.pthreads}/lib";
       };
     };
 }
