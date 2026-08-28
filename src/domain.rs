@@ -1,6 +1,8 @@
 use crate::config;
+use pinyin::ToPinyinMulti;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::DataExchange::*;
 use windows::Win32::System::Memory::*;
@@ -16,10 +18,6 @@ pub(crate) fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-pub(crate) fn to_wide_slice(s: &str) -> Vec<u16> {
-    s.encode_utf16().collect()
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Launch {
@@ -31,14 +29,17 @@ pub enum Action {
     ShutdownSystem,
     RestartSystem,
     CopyText(Arc<str>),
+    PasteText(Arc<str>),
+    PasteFiles(Arc<[std::path::PathBuf]>),
     ExitApp,
+    OpenConfig,
+    RestartApp,
 }
 
 impl Action {
     pub fn execute(&self) {
         self.run(false);
     }
-
     pub fn execute_as_admin(&self) {
         self.run(true);
     }
@@ -64,9 +65,26 @@ impl Action {
                     .args(["/r", "/t", "0"])
                     .spawn();
             }
+            Action::OpenConfig => {
+                let path = config::get_config_path();
+                let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
+            }
+            Action::RestartApp => {
+                if let Ok(exe) = std::env::current_exe() {
+                    let current_pid = std::process::id();
+                    use std::os::windows::process::CommandExt;
+                    let _ = std::process::Command::new(&exe)
+                        .arg("--restarted-from")
+                        .arg(current_pid.to_string())
+                        .creation_flags(0x00000008 | 0x00000200)
+                        .spawn();
+                }
+                unsafe {
+                    PostQuitMessage(0);
+                }
+            }
             Action::Launch { path, verb } => {
                 let path_str = &**path;
-
                 unsafe {
                     let _ = AllowSetForegroundWindow(0xFFFFFFFF);
                 }
@@ -74,8 +92,6 @@ impl Action {
                 let (file, params, working_dir) =
                     if let Some(cmd) = path_str.strip_prefix("cmd.exe /k ") {
                         ("cmd.exe", format!("/k {cmd}"), String::new())
-                    } else if let Some(cmd) = path_str.strip_prefix("cmd.exe /c ") {
-                        ("cmd.exe", format!("/c {cmd}"), String::new())
                     } else if path_str.starts_with("shell:AppsFolder\\")
                         || path_str.to_lowercase().ends_with(".lnk")
                         || path_str.to_lowercase().ends_with(".url")
@@ -128,28 +144,39 @@ impl Action {
                     nShow: SW_SHOWNORMAL.0,
                     ..Default::default()
                 };
-
                 unsafe {
                     if let Err(e) = ShellExecuteExW(&mut exec_info) {
                         eprintln!("ShellExecuteExW failed: {e:?}, file: {file}");
                     }
                 }
             }
-            Action::CopyText(text) => {
+            Action::CopyText(text) => set_clipboard(text),
+            Action::PasteText(text) => {
+                crate::clipboard::IS_INTERNAL_COPY.store(true, Ordering::SeqCst);
                 set_clipboard(text);
+                std::thread::spawn(simulate_paste);
+            }
+            Action::PasteFiles(paths) => {
+                crate::clipboard::IS_INTERNAL_COPY.store(true, Ordering::SeqCst);
+                set_clipboard_files(paths);
+                std::thread::spawn(simulate_paste);
             }
         }
     }
 }
 
 pub struct ClipboardGuard;
-
 impl ClipboardGuard {
     pub fn open() -> Option<Self> {
-        unsafe { OpenClipboard(None).ok().map(|_| ClipboardGuard) }
+        for _ in 0..5 {
+            if unsafe { OpenClipboard(None).is_ok() } {
+                return Some(ClipboardGuard);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        None
     }
 }
-
 impl Drop for ClipboardGuard {
     fn drop(&mut self) {
         unsafe {
@@ -172,10 +199,7 @@ fn set_clipboard(text: &str) {
             if !ptr.is_null() {
                 std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, ptr as *mut u8, size);
                 let _ = GlobalUnlock(hmem);
-                let delivered = matches!(
-                    SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hmem.0))),
-                    Ok(h) if !h.0.is_null()
-                );
+                let delivered = matches!(SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hmem.0))), Ok(h) if !h.0.is_null());
                 if !delivered {
                     let _ = GlobalFree(Some(hmem));
                 }
@@ -214,10 +238,11 @@ pub enum ItemKind {
     Application,
     Calculator { result: Arc<str> },
     Command { raw: Arc<str> },
-    Config,
-    Exit,
     Web,
     Path,
+    System,
+    AppMgmt,
+    Clipboard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,26 +266,48 @@ pub struct Item {
 impl Item {
     pub fn new_application(name: &str, path: &str) -> Self {
         let name_lower = name.to_lowercase();
-        let mut keys: Vec<(KeyKind, Arc<str>)> =
-            vec![(KeyKind::Name, Arc::from(name_lower.as_str()))];
+        // preallocate: typical apps have ~4 keys (Name, Pinyin, Initials, Alias)
+        let mut keys: Vec<(KeyKind, Arc<str>)> = Vec::with_capacity(4);
+        keys.push((KeyKind::Name, Arc::from(name_lower.as_str())));
 
-        let mut initials = String::with_capacity(name.len());
-        let mut full = String::with_capacity(name.len() * 4);
+        // Build pinyin index (no spaces) and initials in correct order.
+        let mut pinyin_joined = String::with_capacity(name.len() * 4);
+        let mut initials_chars: Vec<char> = Vec::with_capacity(name.len());
         let mut has_cjk = false;
+        let mut prev_is_alphanumeric = false;
+
         for c in name.chars() {
             if c.is_ascii_alphanumeric() {
                 let lower = c.to_ascii_lowercase();
-                initials.push(lower);
-                full.push(lower);
-            } else if let Some(py) = crate::pinyin::get_char_pinyin(c) {
+                pinyin_joined.push(lower);
+                if !prev_is_alphanumeric {
+                    // Only take the first letter of each ASCII word
+                    initials_chars.push(lower);
+                }
+                prev_is_alphanumeric = true;
+            } else if let Some(multi) = c.to_pinyin_multi() {
                 has_cjk = true;
-                initials.push(py.as_bytes()[0] as char);
-                full.push_str(py);
+                prev_is_alphanumeric = false;
+                if let Some(first_py) = multi.into_iter().next() {
+                    let plain = first_py.plain();
+                    pinyin_joined.push_str(plain);
+                    if let Some(first_char) = plain.chars().next() {
+                        initials_chars.push(first_char);
+                    }
+                }
+            } else {
+                prev_is_alphanumeric = false;
             }
         }
-        if has_cjk {
-            keys.push((KeyKind::Pinyin, Arc::from(full)));
-            keys.push((KeyKind::Initials, Arc::from(initials)));
+
+        if has_cjk && !pinyin_joined.is_empty() {
+            // Store pinyin without spaces for zero-allocation search
+            keys.push((KeyKind::Pinyin, Arc::from(pinyin_joined.as_str())));
+        }
+
+        let initials_str: String = initials_chars.into_iter().collect();
+        if initials_str.len() >= 2 && initials_str != name_lower {
+            keys.push((KeyKind::Initials, Arc::from(initials_str.as_str())));
         }
 
         if !path.starts_with("shell:")
@@ -275,7 +322,6 @@ impl Item {
                 keys.push((KeyKind::Alias, Arc::from(stem_lower)));
             }
         }
-
         let path_arc: Arc<str> = Arc::from(path);
         Self {
             name: Arc::from(name),
@@ -305,11 +351,12 @@ impl Item {
     }
 
     pub fn new_command(raw_cmd: &str) -> Self {
-        let action_str: Arc<str> = if Path::new(raw_cmd).exists() {
-            Arc::from(raw_cmd)
-        } else {
-            Arc::from(format!("cmd.exe /c {raw_cmd} || pause"))
-        };
+        let action_str: Arc<str> =
+            if Path::new(raw_cmd).is_absolute() && Path::new(raw_cmd).exists() {
+                Arc::from(raw_cmd)
+            } else {
+                Arc::from(format!("cmd.exe /k {raw_cmd}"))
+            };
         Self {
             name: Arc::from(format!("Run command: {raw_cmd}")),
             keys: Box::new([]),
@@ -325,45 +372,33 @@ impl Item {
         }
     }
 
-    pub fn new_config() -> Self {
-        let cfg_path = config::get_config_path();
-        let path_str = cfg_path.to_string_lossy().to_string();
-        let path_arc: Arc<str> = Arc::from(path_str.as_str());
+    pub fn new_system(name: &str, cmd: &str, action: Action, aliases: &[&str]) -> Self {
+        let mut keys = vec![(KeyKind::Name, Arc::from(cmd))];
+        for alias in aliases {
+            keys.push((KeyKind::Alias, Arc::from(*alias)));
+        }
         Self {
-            name: Arc::from("Open Config (config.toml)"),
-            keys: vec![
-                (KeyKind::Name, Arc::from("config")),
-                (KeyKind::Alias, Arc::from("configuration")),
-                (KeyKind::Alias, Arc::from("settings")),
-                (KeyKind::Alias, Arc::from("preference")),
-                (KeyKind::Alias, Arc::from("options")),
-            ]
-            .into_boxed_slice(),
-            path: path_arc.clone(),
-            kind: ItemKind::Config,
+            name: Arc::from(name),
+            path: Arc::from(cmd),
+            kind: ItemKind::System,
             priority_penalty: 0,
-            action: Action::Launch {
-                path: path_arc,
-                verb: None,
-            },
+            action,
+            keys: keys.into_boxed_slice(),
         }
     }
 
-    pub fn new_exit() -> Self {
+    pub fn new_app_mgmt(name: &str, cmd: &str, action: Action, aliases: &[&str]) -> Self {
+        let mut keys = vec![(KeyKind::Name, Arc::from(cmd))];
+        for alias in aliases {
+            keys.push((KeyKind::Alias, Arc::from(*alias)));
+        }
         Self {
-            name: Arc::from("Exit Mist"),
-            keys: vec![
-                (KeyKind::Name, Arc::from("exit")),
-                (KeyKind::Alias, Arc::from("mist")),
-                (KeyKind::Alias, Arc::from("quit")),
-                (KeyKind::Alias, Arc::from("close")),
-                (KeyKind::Alias, Arc::from(":q")),
-            ]
-            .into_boxed_slice(),
-            path: Arc::from("Quit the launcher process"),
-            kind: ItemKind::Exit,
+            name: Arc::from(name),
+            path: Arc::from(cmd),
+            kind: ItemKind::AppMgmt,
             priority_penalty: 0,
-            action: Action::ExitApp,
+            action,
+            keys: keys.into_boxed_slice(),
         }
     }
 
@@ -379,4 +414,85 @@ impl Item {
 pub struct Match<'a> {
     pub item: &'a Item,
     pub score: i32,
+}
+
+pub fn simulate_paste() {
+    std::thread::sleep(std::time::Duration::from_millis(45));
+
+    unsafe {
+        use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        let inputs = [
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VK_CONTROL,
+                        ..Default::default()
+                    },
+                },
+            },
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VK_V,
+                        ..Default::default()
+                    },
+                },
+            },
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VK_V,
+                        dwFlags: KEYEVENTF_KEYUP,
+                        ..Default::default()
+                    },
+                },
+            },
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VK_CONTROL,
+                        dwFlags: KEYEVENTF_KEYUP,
+                        ..Default::default()
+                    },
+                },
+            },
+        ];
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+pub fn set_clipboard_files(paths: &[std::path::PathBuf]) {
+    let _guard = match ClipboardGuard::open() {
+        Some(g) => g,
+        None => return,
+    };
+    unsafe {
+        let _ = EmptyClipboard();
+        let mut total_wchars = Vec::new();
+        for p in paths {
+            total_wchars.extend(to_wide(&p.to_string_lossy()));
+        }
+        total_wchars.push(0);
+
+        let dropfiles_size = std::mem::size_of::<windows::Win32::UI::Shell::DROPFILES>();
+        let total_bytes = dropfiles_size + total_wchars.len() * 2;
+
+        if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, total_bytes) {
+            let ptr = GlobalLock(hmem);
+            if !ptr.is_null() {
+                let df = ptr as *mut windows::Win32::UI::Shell::DROPFILES;
+                (*df).pFiles = dropfiles_size as u32;
+                (*df).fWide = BOOL(1);
+
+                let dest = (ptr as *mut u8).add(dropfiles_size) as *mut u16;
+                std::ptr::copy_nonoverlapping(total_wchars.as_ptr(), dest, total_wchars.len());
+                let _ = GlobalUnlock(hmem);
+                let _ = SetClipboardData(CF_HDROP.0 as u32, Some(HANDLE(hmem.0)));
+            }
+        }
+    }
 }

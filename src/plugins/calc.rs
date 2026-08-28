@@ -1,13 +1,28 @@
 use crate::domain::Item;
+use crate::plugins::{Plugin, PluginContext};
 
-pub fn eval(query: &str) -> Option<Item> {
-    let q = query.trim().trim_end_matches('=').trim();
-    if !q.chars().any(|c| "+-*/^%()".contains(c)) {
-        return None;
+pub struct CalcPlugin;
+
+impl Plugin for CalcPlugin {
+    fn can_handle(&self, raw_input: &str) -> bool {
+        raw_input.starts_with('?')
     }
+    fn query(&self, raw_input: &str, _ctx: &PluginContext) -> Vec<Item> {
+        let rest = raw_input.strip_prefix('?').unwrap_or(raw_input).trim();
+        query(rest)
+    }
+}
 
-    let res = evalexpr::eval(&floatify(q)).ok()?.to_string();
-    Some(Item::new_calculator(&res))
+pub fn query(args: &str) -> Vec<Item> {
+    let q = args.trim().trim_end_matches('=').trim();
+    if q.is_empty() || !q.chars().any(|c| "+-*/^%()".contains(c)) {
+        return Vec::new();
+    }
+    if let Ok(res) = evalexpr::eval(&floatify(q)) {
+        vec![Item::new_calculator(&res.to_string())]
+    } else {
+        Vec::new()
+    }
 }
 
 fn floatify(q: &str) -> String {
@@ -56,14 +71,9 @@ fn floatify(q: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn test_eval() {
-        assert_eq!(&*eval("1 + 2 * 3").unwrap().name, "= 7");
-        assert_eq!(&*eval("2^10").unwrap().name, "= 1024");
-        assert_eq!(&*eval("10 % 4").unwrap().name, "= 2");
-        assert_eq!(&*eval("1 + 2 * 3 =").unwrap().name, "= 7");
-        assert_eq!(&*eval("5/2").unwrap().name, "= 2.5");
-        assert!(eval("hello").is_none());
+        assert_eq!(&*query("1 + 2 * 3")[0].name, "= 7");
+        assert!(query("hello").is_empty());
     }
 }

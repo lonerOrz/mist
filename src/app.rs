@@ -1,11 +1,17 @@
-use crate::config::Config;
+use crate::clipboard::{ClipboardEntry, ClipboardListener};
+use crate::config::{Config, HOTKEY_ID};
 use crate::domain::Item;
 use crate::history::History;
-use crate::query::QueryPipeline;
 use crate::renderer::{Renderer, Spring, Theme, metrics, window_scale};
-use windows::Win32::Foundation::HWND;
+use crate::router;
+use std::collections::VecDeque;
+use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+use windows::Win32::UI::Input::Ime::{
+    CFS_POINT, COMPOSITIONFORM, ImmGetContext, ImmReleaseContext, ImmSetCompositionWindow,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::UnregisterHotKey;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const TIMER_ANIMATION: usize = 2;
@@ -14,6 +20,7 @@ pub struct App {
     pub config: Config,
     pub index: Vec<Item>,
     pub query: String,
+    pub ime_comp: String,
     pub results: Vec<Item>,
     pub selected: usize,
     pub hovered: Option<usize>,
@@ -23,6 +30,9 @@ pub struct App {
     pub spring_animating: bool,
     pub history: History,
     pub renderer: Renderer,
+    pub clipboard_history: VecDeque<ClipboardEntry>,
+    pub clipboard_listener: ClipboardListener,
+    pub scroll_spring: Spring,
 }
 
 impl App {
@@ -33,6 +43,7 @@ impl App {
             config,
             index: Vec::new(),
             query: String::new(),
+            ime_comp: String::new(),
             results: Vec::new(),
             selected: 0,
             hovered: None,
@@ -42,11 +53,13 @@ impl App {
             spring_animating: false,
             history: History::load(),
             renderer,
+            clipboard_history: VecDeque::with_capacity(500),
+            clipboard_listener: ClipboardListener::new(),
+            scroll_spring: Spring::new(0.0),
         }
     }
 
-    pub fn set_index(&mut self, mut items: Vec<Item>) {
-        items.extend(crate::sources::system::builtins());
+    pub fn set_index(&mut self, items: Vec<Item>) {
         self.index = items;
     }
 
@@ -76,28 +89,140 @@ impl App {
         }
     }
 
-    pub fn on_query_change(&mut self, hwnd: HWND) {
-        self.selected = 0;
-        self.hovered = None;
-
-        self.results = QueryPipeline::query(&self.query, &self.index, &self.history, &self.config);
-        self.pill.reset(metrics::LIST_TOP);
-        self.update_window_geometry(hwnd);
-    }
-
-    pub fn move_selection_up(&mut self, hwnd: HWND) {
-        if self.selected > 0 {
-            self.selected -= 1;
-            self.pill.set_target(list_item_top(self.selected));
-            self.trigger_animation(hwnd);
+    pub fn display_query(&self) -> String {
+        if self.ime_comp.is_empty() {
+            self.query.clone()
+        } else {
+            format!("{}{}", self.query, self.ime_comp)
         }
     }
 
+    pub fn update_ime_position(&mut self, hwnd: HWND) {
+        unsafe {
+            let himc = ImmGetContext(hwnd);
+            if himc.0.is_null() {
+                return;
+            }
+
+            let s = window_scale(hwnd);
+            let input_clip_left = metrics::INPUT_X;
+            let input_clip_right = self.config.width as f32 - 24.0;
+            let max_visible_width = input_clip_right - input_clip_left;
+
+            let display_text = self.display_query();
+            let caret_offset_x = self.renderer.calculate_caret_offset(hwnd, &display_text);
+            let scroll_x = if caret_offset_x > max_visible_width {
+                caret_offset_x - max_visible_width
+            } else {
+                0.0
+            };
+
+            let final_caret_x = input_clip_left + caret_offset_x - scroll_x;
+            let pt_x = (final_caret_x * s).round() as i32;
+            let pt_y = ((metrics::HEADER_HEIGHT as f32 - 10.0) * s).round() as i32;
+
+            let form = COMPOSITIONFORM {
+                dwStyle: CFS_POINT,
+                ptCurrentPos: POINT { x: pt_x, y: pt_y },
+                rcArea: Default::default(),
+            };
+
+            let _ = ImmSetCompositionWindow(himc, &form);
+            let _ = ImmReleaseContext(hwnd, himc);
+        }
+    }
+
+    pub fn on_query_change(&mut self, hwnd: HWND) {
+        self.pull_clipboard_updates();
+        self.selected = 0;
+        self.hovered = None;
+        self.scroll_spring.reset(0.0);
+        self.results = router::route_query(
+            &self.query,
+            &self.index,
+            &self.history,
+            &self.config,
+            self.clipboard_history.make_contiguous(),
+        );
+        self.pill.reset(metrics::LIST_TOP);
+        self.update_window_geometry(hwnd);
+        self.update_ime_position(hwnd);
+    }
+    pub fn pull_clipboard_updates(&mut self) {
+        let fresh: Vec<ClipboardEntry> = self.clipboard_listener.rx.try_iter().collect();
+        for entry in fresh {
+            self.push_unique_front(entry);
+        }
+    }
+
+    fn push_unique_front(&mut self, entry: ClipboardEntry) {
+        let hash = crate::clipboard::calculate_entry_hash(&entry);
+        // remove any existing entry with the same content, then move to front
+        self.clipboard_history
+            .retain(|e| crate::clipboard::calculate_entry_hash(e) != hash);
+        self.clipboard_history.push_front(entry);
+    }
+    pub fn move_selection_up(&mut self, hwnd: HWND) {
+        if self.results.is_empty() {
+            return;
+        }
+        if self.selected > 0 {
+            self.selected -= 1;
+        } else {
+            // wrap-around: first item Up jumps to last item
+            self.selected = self.results.len() - 1;
+        }
+        self.pill.set_target(metrics::list_item_top(self.selected));
+        self._adjust_scroll_for_selected();
+        self.trigger_animation(hwnd);
+    }
+
     pub fn move_selection_down(&mut self, hwnd: HWND) {
-        if !self.results.is_empty() && self.selected < self.results.len() - 1 {
+        if self.results.is_empty() {
+            return;
+        }
+        if self.selected + 1 < self.results.len() {
             self.selected += 1;
-            self.pill.set_target(list_item_top(self.selected));
-            self.trigger_animation(hwnd);
+        } else {
+            // wrap-around: last item Down returns to first item
+            self.selected = 0;
+        }
+        self.pill.set_target(metrics::list_item_top(self.selected));
+        self._adjust_scroll_for_selected();
+        self.trigger_animation(hwnd);
+    }
+
+    fn _adjust_scroll_for_selected(&mut self) {
+        let item_h = metrics::ITEM_HEIGHT as f32;
+        let visible = self.config.max_results;
+        if visible == 0 || self.results.is_empty() {
+            return;
+        }
+
+        let max_scroll = ((self.results.len().saturating_sub(visible)) as f32 * item_h).max(0.0);
+
+        // wrapped to item 0: snap viewport to top
+        if self.selected == 0 {
+            self.scroll_spring.set_target(0.0);
+            return;
+        }
+        // wrapped to last item: snap viewport to bottom
+        if self.selected == self.results.len() - 1 {
+            self.scroll_spring.set_target(max_scroll);
+            return;
+        }
+
+        let cur_target = self.scroll_spring.target;
+        let first_idx = (cur_target / item_h).round() as usize;
+        let last_idx = first_idx + visible - 1;
+
+        if self.selected < first_idx {
+            self.scroll_spring
+                .set_target(((self.selected as f32) * item_h).clamp(0.0, max_scroll));
+        } else if self.selected > last_idx {
+            self.scroll_spring.set_target(
+                (((self.selected + 1 - visible) as f32) * item_h).clamp(0.0, max_scroll),
+            );
         }
     }
 
@@ -110,13 +235,11 @@ impl App {
             }
             return;
         }
-        let idx = ((y - metrics::LIST_TOP) / metrics::ITEM_HEIGHT as f32) as usize;
+        let idx = ((y - metrics::LIST_TOP + self.scroll_spring.current)
+            / metrics::ITEM_HEIGHT as f32) as usize;
         if idx < self.results.len() {
-            let changed = self.hovered != Some(idx) || self.selected != idx;
-            self.hovered = Some(idx);
-            self.selected = idx;
-            self.pill.set_target(list_item_top(idx));
-            if changed {
+            if self.hovered != Some(idx) {
+                self.hovered = Some(idx);
                 self.trigger_animation(hwnd);
             }
         } else if self.hovered.take().is_some() {
@@ -130,27 +253,19 @@ impl App {
         if self.results.is_empty() || y < metrics::LIST_TOP {
             return;
         }
-        let idx = ((y - metrics::LIST_TOP) / metrics::ITEM_HEIGHT as f32) as usize;
+        let idx = ((y - metrics::LIST_TOP + self.scroll_spring.current)
+            / metrics::ITEM_HEIGHT as f32) as usize;
         if idx < self.results.len() {
             self.selected = idx;
-            self.pill.set_target(list_item_top(idx));
-
+            self.pill.set_target(metrics::list_item_top(idx));
             let item = &self.results[idx];
             let is_calc = matches!(item.kind, crate::domain::ItemKind::Calculator { .. });
-            let is_cfg = matches!(item.kind, crate::domain::ItemKind::Config);
-            let is_exit = matches!(item.kind, crate::domain::ItemKind::Exit);
-            let admin_min_x = (self.config.width - metrics::ADMIN_ZONE_FAR) as f32;
-            let admin_max_x = (self.config.width - metrics::ADMIN_ZONE_NEAR) as f32;
+            let is_mgmt = matches!(item.kind, crate::domain::ItemKind::AppMgmt);
 
-            let row_top = list_item_top(idx);
-            let in_admin_button = y >= row_top + 13.5 && y <= row_top + 36.5;
-
+            // unify click-area detection in metrics to avoid hardcoded magic numbers
             if !is_calc
-                && !is_cfg
-                && !is_exit
-                && in_admin_button
-                && x >= admin_min_x
-                && x <= admin_max_x
+                && !is_mgmt
+                && metrics::is_in_admin_button(idx, self.config.width as f32, x, y)
             {
                 self.execute_selected_admin(hwnd);
             } else {
@@ -164,6 +279,15 @@ impl App {
             let action = item.action.clone();
             let path = item.path.clone();
             self.history.record_launch(&path);
+
+            if matches!(action, crate::domain::Action::RestartApp) {
+                unsafe {
+                    let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+                }
+                action.execute();
+                return;
+            }
+
             action.execute();
             self.hide(hwnd);
         }
@@ -174,6 +298,15 @@ impl App {
             let action = item.action.clone();
             let path = item.path.clone();
             self.history.record_launch(&path);
+
+            if matches!(action, crate::domain::Action::RestartApp) {
+                unsafe {
+                    let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+                }
+                action.execute();
+                return;
+            }
+
             action.execute_as_admin();
             self.hide(hwnd);
         }
@@ -181,14 +314,21 @@ impl App {
 
     pub fn hide(&mut self, hwnd: HWND) {
         self.query.clear();
+        self.query.shrink_to_fit();
+        self.ime_comp.clear();
+        self.ime_comp.shrink_to_fit();
         self.results.clear();
+        self.results.shrink_to_fit();
         self.selected = 0;
         self.hovered = None;
         self.height_spring.reset(metrics::HEADER_HEIGHT as f32);
         self.pill.reset(metrics::LIST_TOP);
+        self.scroll_spring.reset(0.0);
         self.spring_animating = false;
-
         unsafe {
+            let _ = KillTimer(Some(hwnd), TIMER_ANIMATION);
+            let _ = KillTimer(Some(hwnd), crate::TIMER_CARET);
+
             let s = window_scale(hwnd);
             let _ = SetWindowPos(
                 hwnd,
@@ -200,7 +340,6 @@ impl App {
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
             );
             let _ = ShowWindow(hwnd, SW_HIDE);
-
             let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
         }
     }
@@ -208,8 +347,8 @@ impl App {
     pub fn render_current_frame(&mut self, hwnd: HWND) {
         let pill_moving = !self.results.is_empty() && self.pill.update(1.0 / 60.0);
         let height_moving = self.height_spring.update(1.0 / 60.0);
-        self.spring_animating = pill_moving || height_moving;
-
+        let scroll_moving = self.scroll_spring.update(1.0 / 60.0);
+        self.spring_animating = pill_moving || height_moving || scroll_moving;
         if height_moving {
             let h = self.height_spring.current.round() as i32;
             let s = window_scale(hwnd);
@@ -225,25 +364,41 @@ impl App {
                 );
             }
         }
-
         let items: Vec<&Item> = self.results.iter().collect();
         let pill_y = if self.results.is_empty() {
             metrics::LIST_TOP
         } else {
             self.pill.current
         };
+        let display_text = self.display_query();
         unsafe {
             let _ = self.renderer.render(
                 hwnd,
-                &self.query,
+                &display_text,
                 &self.config.placeholder,
                 &items,
                 self.selected,
                 self.caret_visible,
                 self.hovered,
                 pill_y,
+                self.config.max_results,
+                self.scroll_spring.current,
             );
         }
+    }
+
+    pub fn on_mouse_wheel(&mut self, hwnd: HWND, delta: i16) {
+        let visible = self.config.max_results;
+        if self.results.len() <= visible || visible == 0 {
+            return;
+        }
+        let item_h = metrics::ITEM_HEIGHT as f32;
+        let max_scroll = ((self.results.len() - visible) as f32) * item_h;
+        let step = item_h * if delta > 0 { -1.0 } else { 1.0 };
+        let new_target = (self.scroll_spring.target + step).clamp(0.0, max_scroll);
+        self.scroll_spring.set_target(new_target);
+        // wheel only drives viewport scroll, never selected; Pill follows its item and viewport
+        self.trigger_animation(hwnd);
     }
 
     pub fn trigger_animation(&mut self, hwnd: HWND) {
@@ -255,7 +410,7 @@ impl App {
     }
 
     fn update_window_geometry(&mut self, hwnd: HWND) {
-        let count = self.results.len();
+        let count = self.results.len().min(self.config.max_results);
         let new_h = if count == 0 {
             metrics::HEADER_HEIGHT
         } else {
@@ -264,8 +419,4 @@ impl App {
         self.height_spring.target = new_h as f32;
         self.trigger_animation(hwnd);
     }
-}
-
-fn list_item_top(idx: usize) -> f32 {
-    metrics::LIST_TOP + (idx as f32) * metrics::ITEM_HEIGHT as f32
 }

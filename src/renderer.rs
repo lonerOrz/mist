@@ -1,4 +1,4 @@
-use crate::domain::{Item, ItemKind, to_wide, to_wide_slice};
+use crate::domain::{Item, ItemKind, to_wide};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use windows::Win32::Foundation::*;
@@ -22,6 +22,23 @@ pub mod metrics {
     pub const INPUT_X: f32 = 48.0;
     pub const ADMIN_ZONE_FAR: i32 = 176;
     pub const ADMIN_ZONE_NEAR: i32 = 82;
+    pub const SCROLLBAR_WIDTH: f32 = 3.0;
+    pub const SCROLLBAR_MARGIN_RIGHT: f32 = 4.0;
+
+    #[inline]
+    pub fn list_item_top(idx: usize) -> f32 {
+        LIST_TOP + (idx as f32) * ITEM_HEIGHT as f32
+    }
+
+    #[inline]
+    pub fn is_in_admin_button(idx: usize, width: f32, x: f32, y: f32) -> bool {
+        let row_top = list_item_top(idx);
+        let admin_min_x = width - ADMIN_ZONE_FAR as f32;
+        let admin_max_x = width - ADMIN_ZONE_NEAR as f32;
+        let in_y = y >= row_top + 13.5 && y <= row_top + 36.5;
+        let in_x = x >= admin_min_x && x <= admin_max_x;
+        in_y && in_x
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -59,17 +76,17 @@ const ICON_CMD: BadgeGlyphs = BadgeGlyphs {
     nerd: w!("\u{f120}"),
     fluent: w!("\u{e756}"),
 };
-const ICON_CFG: BadgeGlyphs = BadgeGlyphs {
+const ICON_SYS: BadgeGlyphs = BadgeGlyphs {
+    nerd: w!("\u{f2db}"),
+    fluent: w!("\u{e7ba}"),
+};
+const ICON_APP_MGMT: BadgeGlyphs = BadgeGlyphs {
     nerd: w!("\u{f013}"),
     fluent: w!("\u{e713}"),
 };
 const ICON_APP: BadgeGlyphs = BadgeGlyphs {
     nerd: w!("\u{f009}"),
     fluent: w!("\u{e71d}"),
-};
-const ICON_EXIT: BadgeGlyphs = BadgeGlyphs {
-    nerd: w!("\u{f011}"),
-    fluent: w!("\u{e7e8}"),
 };
 const ICON_WEB: BadgeGlyphs = BadgeGlyphs {
     nerd: w!("\u{f0ac}"),
@@ -78,6 +95,10 @@ const ICON_WEB: BadgeGlyphs = BadgeGlyphs {
 const ICON_PATH: BadgeGlyphs = BadgeGlyphs {
     nerd: w!("\u{f07b}"),
     fluent: w!("\u{e8b7}"),
+};
+const ICON_CLIP: BadgeGlyphs = BadgeGlyphs {
+    nerd: w!("\u{f0ea}"),
+    fluent: w!("\u{e77f}"),
 };
 
 fn pick_glyph(g: &BadgeGlyphs, is_nerd: bool) -> &[u16] {
@@ -90,10 +111,8 @@ fn pick_glyph(g: &BadgeGlyphs, is_nerd: bool) -> &[u16] {
     }
 }
 const KEY_CAP_COPY: PCWSTR = w!("↵ Copy");
-const KEY_CAP_RUN: PCWSTR = w!("↵ Run");
+const KEY_CAP_PASTE: PCWSTR = w!("↵ Paste");
 const KEY_CAP_OPEN: PCWSTR = w!("↵ Open");
-const KEY_CAP_EDIT: PCWSTR = w!("↵ Edit");
-const KEY_CAP_EXIT: PCWSTR = w!("↵ Exit");
 const KEY_CAP_ADMIN: PCWSTR = w!("Shift+↵ Admin");
 
 pub fn window_scale(hwnd: HWND) -> f32 {
@@ -187,8 +206,9 @@ fn probe_nerd_font_support(dwrite_factory: &IDWriteFactory, font_family: &str) -
 
 pub struct IconCache {
     wic_factory: IWICImagingFactory,
-    cache: HashMap<Arc<str>, Option<ID2D1Bitmap>>,
+    cache: HashMap<Arc<str>, (Option<ID2D1Bitmap>, u64)>,
     loading: HashSet<Arc<str>>,
+    counter: u64,
 }
 
 impl IconCache {
@@ -199,6 +219,7 @@ impl IconCache {
             wic_factory,
             cache: HashMap::new(),
             loading: HashSet::new(),
+            counter: 0,
         })
     }
 
@@ -211,8 +232,12 @@ impl IconCache {
         path: &Arc<str>,
         px: u32,
     ) -> Option<ID2D1Bitmap> {
-        let key: Arc<str> = Arc::from(format!("{path}\u{0}{px}").as_str());
-        if let Some(bm) = self.cache.get(&key) {
+        let key: Arc<str> = Arc::from(format!("{path}\u{0}{px}"));
+        self.counter = self.counter.wrapping_add(1);
+        let current_tick = self.counter;
+
+        if let Some((bm, tick)) = self.cache.get_mut(&key) {
+            *tick = current_tick;
             return bm.clone();
         }
         if self.loading.contains(&key) {
@@ -221,9 +246,19 @@ impl IconCache {
         self.loading.insert(key.clone());
         let loaded = unsafe { self.load_shell_icon(rt, path, px) };
         self.loading.remove(&key);
-        self.cache.insert(key, loaded.clone());
+        self.cache.insert(key, (loaded.clone(), current_tick));
+
+        // real LRU eviction: once cache exceeds 512, evict the 256 oldest by access tick
         if self.cache.len() > 512 {
-            self.cache.clear();
+            let mut entries: Vec<(Arc<str>, u64)> = self
+                .cache
+                .iter()
+                .map(|(k, (_, tick))| (k.clone(), *tick))
+                .collect();
+            entries.sort_unstable_by_key(|(_, tick)| *tick);
+            for (k, _) in entries.into_iter().take(256) {
+                self.cache.remove(&k);
+            }
         }
         loaded
     }
@@ -443,6 +478,25 @@ impl Spring {
     }
 }
 
+struct D2DScratchpad {
+    utf16_buf: Vec<u16>,
+}
+
+impl D2DScratchpad {
+    pub fn new() -> Self {
+        Self {
+            utf16_buf: Vec::with_capacity(1024),
+        }
+    }
+
+    #[inline]
+    pub fn encode_utf16<'a>(&'a mut self, s: &str) -> &'a [u16] {
+        self.utf16_buf.clear();
+        self.utf16_buf.extend(s.encode_utf16());
+        &self.utf16_buf
+    }
+}
+
 pub struct Renderer {
     d2d_factory: ID2D1Factory,
     dwrite_factory: IDWriteFactory,
@@ -450,6 +504,7 @@ pub struct Renderer {
     font_family: String,
     theme: Theme,
     context: Option<D2DContext>,
+    scratch: D2DScratchpad,
 }
 
 impl Renderer {
@@ -467,6 +522,7 @@ impl Renderer {
                 font_family,
                 theme: Theme::from_config(&crate::config::Config::default()),
                 context: None,
+                scratch: D2DScratchpad::new(),
             })
         }
     }
@@ -657,6 +713,41 @@ impl Renderer {
         }
     }
 
+    pub fn calculate_caret_offset(&mut self, hwnd: HWND, text: &str) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let _ = unsafe { self.ensure_context(hwnd) };
+        let Some(ctx) = &self.context else {
+            return 0.0;
+        };
+        let text_w = self.scratch.encode_utf16(text);
+        if let Ok(layout) = unsafe {
+            self.dwrite_factory.CreateTextLayout(
+                text_w,
+                &ctx.formats.input,
+                10000.0,
+                metrics::HEADER_HEIGHT as f32,
+            )
+        } {
+            let mut x = 0.0;
+            let mut y = 0.0;
+            let mut hit_metrics = DWRITE_HIT_TEST_METRICS::default();
+            let _ = unsafe {
+                layout.HitTestTextPosition(
+                    text_w.len() as u32,
+                    false,
+                    &mut x,
+                    &mut y,
+                    &mut hit_metrics,
+                )
+            };
+            x
+        } else {
+            0.0
+        }
+    }
+
     /// # Safety
     ///
     /// `hwnd` must be an initialized and active window handle on the UI thread.
@@ -671,6 +762,8 @@ impl Renderer {
         caret_visible: bool,
         hovered: Option<usize>,
         pill_y: f32,
+        max_results: usize,
+        scroll_y: f32,
     ) -> Result<()> {
         unsafe {
             self.ensure_context(hwnd)?;
@@ -680,6 +773,7 @@ impl Renderer {
             let Renderer {
                 icon_cache,
                 context,
+                scratch,
                 ..
             } = self;
             let ctx = context.as_mut().unwrap();
@@ -699,6 +793,10 @@ impl Renderer {
             let target: ID2D1RenderTarget = ctx.target.cast()?;
             target.BeginDraw();
 
+            // ponytail: target.GetSize() returns DIP size matching the dpiX/dpiY coordinate space;
+            // GetClientRect would return physical pixels and stretch all coordinates at >100% DPI.
+            let dip_size = target.GetSize();
+
             target.Clear(Some(&D2D1_COLOR_F {
                 r: 0.11,
                 g: 0.11,
@@ -709,8 +807,8 @@ impl Renderer {
             let win_rect = D2D_RECT_F {
                 left: 0.5,
                 top: 0.5,
-                right: size.width as f32 - 0.5,
-                bottom: size.height as f32 - 0.5,
+                right: dip_size.width - 0.5,
+                bottom: dip_size.height - 0.5,
             };
             target.DrawRectangle(&win_rect, &ctx.brushes.border, 1.0, None);
 
@@ -739,12 +837,12 @@ impl Renderer {
             } else {
                 (query, false)
             };
-            let q_wide = to_wide_slice(text_to_draw);
+            let q_wide = scratch.encode_utf16(text_to_draw);
 
             let mut caret_offset_x = 0.0;
             if !is_placeholder
                 && let Ok(layout) = dwrite_factory.CreateTextLayout(
-                    &q_wide,
+                    q_wide,
                     &ctx.formats.input,
                     10000.0,
                     metrics::HEADER_HEIGHT as f32,
@@ -791,7 +889,7 @@ impl Renderer {
 
             target.PushAxisAlignedClip(&clip_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             target.DrawText(
-                &q_wide,
+                q_wide,
                 &ctx.formats.input,
                 &input_rect,
                 text_brush,
@@ -815,7 +913,7 @@ impl Renderer {
                 let divider_y = metrics::HEADER_HEIGHT as f32;
                 target.DrawLine(
                     Vector2::new(0.0, divider_y),
-                    Vector2::new(size.width as f32, divider_y),
+                    Vector2::new(dip_size.width, divider_y),
                     &ctx.brushes.divider,
                     1.0,
                     None,
@@ -823,15 +921,33 @@ impl Renderer {
             }
 
             let start_y = metrics::LIST_TOP;
-            let item_h = metrics::ITEM_HEIGHT as f32;
 
-            if !items.is_empty() {
+            // Viewport clipping: prevent items from bleeding into the header or outside rounded corners
+            let clip_top = start_y + 0.5;
+            let clip_bottom = dip_size.height - 0.5;
+            let clip_rect = D2D_RECT_F {
+                left: 0.0,
+                top: clip_top,
+                right: dip_size.width,
+                bottom: clip_bottom,
+            };
+            target.PushAxisAlignedClip(&clip_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+            // Compute floating-point visible range for smooth sub-pixel scrolling
+            let item_h = metrics::ITEM_HEIGHT as f32;
+            let first_idx = (scroll_y / item_h).floor() as usize;
+            // Overdraw: render 2 extra rows so sub-pixel scrolling never reveals a blank edge;
+            // the viewport clip culls the overflow. Pill is in absolute list coords, so minus scroll.
+            let visual_pill_y = pill_y - scroll_y;
+            let last_idx = (first_idx + max_results + 2).min(items.len());
+
+            if last_idx > first_idx {
                 let pill_rect = D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
                         left: 8.0,
-                        top: pill_y,
-                        right: size.width as f32 - 8.0,
-                        bottom: pill_y + item_h - 4.0,
+                        top: visual_pill_y,
+                        right: dip_size.width - 8.0,
+                        bottom: visual_pill_y + item_h - 4.0,
                     },
                     radiusX: theme.pill_radius,
                     radiusY: theme.pill_radius,
@@ -840,29 +956,33 @@ impl Renderer {
                 target.DrawRoundedRectangle(&pill_rect, &ctx.brushes.selection_border, 1.0, None);
             }
 
-            for (i, item) in items.iter().enumerate() {
-                let top = start_y + (i as f32) * item_h;
+            for (global_i, &item) in items
+                .iter()
+                .enumerate()
+                .skip(first_idx)
+                .take(last_idx - first_idx)
+            {
+                // Sub-pixel: use float global index directly, clip region handles frustum culling
+                let top = start_y + (global_i as f32) * item_h - scroll_y;
                 let bottom = top + item_h - 4.0;
 
                 let item_rect = D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
                         left: 8.0,
                         top,
-                        right: size.width as f32 - 8.0,
+                        right: dip_size.width - 8.0,
                         bottom,
                     },
                     radiusX: theme.pill_radius,
                     radiusY: theme.pill_radius,
                 };
 
-                if Some(i) == hovered && i != selected {
+                if Some(global_i) == hovered && global_i != selected {
                     target.FillRoundedRectangle(&item_rect, &ctx.brushes.hover);
                 }
 
                 let is_calc = matches!(item.kind, ItemKind::Calculator { .. });
-                let is_cmd = matches!(item.kind, ItemKind::Command { .. });
-                let is_cfg = matches!(item.kind, ItemKind::Config);
-                let is_exit = matches!(item.kind, ItemKind::Exit);
+                let is_mgmt = matches!(item.kind, ItemKind::AppMgmt);
 
                 let icon_container = D2D_RECT_F {
                     left: 20.0,
@@ -874,7 +994,7 @@ impl Renderer {
                 let badge_fmt = &ctx.formats.badge;
 
                 match &item.kind {
-                    ItemKind::Config => draw_badge(
+                    ItemKind::AppMgmt => draw_badge(
                         &target,
                         &dwrite_factory,
                         icon_fmt,
@@ -882,11 +1002,11 @@ impl Renderer {
                         theme.badge_radius,
                         &ctx.brushes.accent_subtle,
                         &ctx.brushes.accent_border,
-                        pick_glyph(&ICON_CFG, is_nerd_font),
+                        pick_glyph(&ICON_APP_MGMT, is_nerd_font),
                         &ctx.brushes.accent,
                         is_nerd_font,
                     ),
-                    ItemKind::Exit => draw_badge(
+                    ItemKind::System => draw_badge(
                         &target,
                         &dwrite_factory,
                         icon_fmt,
@@ -894,8 +1014,8 @@ impl Renderer {
                         theme.badge_radius,
                         &ctx.brushes.badge_bg,
                         &ctx.brushes.border,
-                        pick_glyph(&ICON_EXIT, is_nerd_font),
-                        &ctx.brushes.text,
+                        pick_glyph(&ICON_SYS, is_nerd_font),
+                        &ctx.brushes.subtext,
                         is_nerd_font,
                     ),
                     ItemKind::Calculator { .. } => draw_badge(
@@ -946,6 +1066,18 @@ impl Renderer {
                         &ctx.brushes.subtext,
                         is_nerd_font,
                     ),
+                    ItemKind::Clipboard => draw_badge(
+                        &target,
+                        &dwrite_factory,
+                        icon_fmt,
+                        &icon_container,
+                        theme.badge_radius,
+                        &ctx.brushes.accent_subtle,
+                        &ctx.brushes.accent_border,
+                        pick_glyph(&ICON_CLIP, is_nerd_font),
+                        &ctx.brushes.accent,
+                        is_nerd_font,
+                    ),
                     ItemKind::Application => {
                         let icon_bmp = icon_cache.get_or_load(&target, &item.path, icon_px);
                         if let Some(bmp) = icon_bmp {
@@ -973,18 +1105,16 @@ impl Renderer {
                     }
                 }
 
-                let text_max_right = size.width as f32 - 185.0;
+                let text_max_right = dip_size.width - 185.0;
 
-                let title_w = to_wide_slice(&item.name);
-                let title_brush = if is_calc || is_cfg {
+                let title_w = scratch.encode_utf16(&item.name);
+                let title_brush = if is_calc {
                     &ctx.brushes.accent
-                } else if is_cmd {
-                    &ctx.brushes.admin_badge
                 } else {
                     &ctx.brushes.text
                 };
                 target.DrawText(
-                    &title_w,
+                    title_w,
                     &ctx.formats.item_title,
                     &D2D_RECT_F {
                         left: 62.0,
@@ -997,9 +1127,9 @@ impl Renderer {
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
 
-                let sub_w = to_wide_slice(&item.path);
+                let sub_w = scratch.encode_utf16(&item.path);
                 target.DrawText(
-                    &sub_w,
+                    sub_w,
                     &ctx.formats.item_sub,
                     &D2D_RECT_F {
                         left: 62.0,
@@ -1012,24 +1142,20 @@ impl Renderer {
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
 
-                if i == selected {
+                if global_i == selected {
                     let action_str = if is_calc {
                         KEY_CAP_COPY
-                    } else if is_cmd {
-                        KEY_CAP_RUN
-                    } else if is_cfg {
-                        KEY_CAP_EDIT
-                    } else if is_exit {
-                        KEY_CAP_EXIT
+                    } else if matches!(item.kind, ItemKind::Clipboard) {
+                        KEY_CAP_PASTE
                     } else {
                         KEY_CAP_OPEN
                     };
 
                     let action_rect = D2D1_ROUNDED_RECT {
                         rect: D2D_RECT_F {
-                            left: size.width as f32 - 76.0,
+                            left: dip_size.width - 76.0,
                             top: top + 13.5,
-                            right: size.width as f32 - 16.0,
+                            right: dip_size.width - 16.0,
                             bottom: top + 36.5,
                         },
                         radiusX: theme.button_radius,
@@ -1046,13 +1172,13 @@ impl Renderer {
                         DWRITE_MEASURING_MODE_NATURAL,
                     );
 
-                    if !is_calc && !is_exit && !is_cfg {
+                    if !is_calc && !is_mgmt {
                         let admin_w = KEY_CAP_ADMIN.as_wide();
                         let admin_rect = D2D1_ROUNDED_RECT {
                             rect: D2D_RECT_F {
-                                left: size.width as f32 - metrics::ADMIN_ZONE_FAR as f32,
+                                left: dip_size.width - metrics::ADMIN_ZONE_FAR as f32,
                                 top: top + 13.5,
-                                right: size.width as f32 - metrics::ADMIN_ZONE_NEAR as f32,
+                                right: dip_size.width - metrics::ADMIN_ZONE_NEAR as f32,
                                 bottom: top + 36.5,
                             },
                             radiusX: theme.button_radius,
@@ -1076,6 +1202,34 @@ impl Renderer {
                     }
                 }
             }
+
+            // Scrollbar indicator
+            if items.len() > max_results && max_results > 0 {
+                let track_top = start_y + 4.0;
+                let list_h = (max_results as f32) * item_h + 8.0;
+                let track_bottom = start_y + list_h - 4.0;
+                let track_h = track_bottom - track_top;
+                let total_h = (items.len() as f32) * item_h;
+                let max_scroll = (total_h - list_h + 8.0).max(1.0);
+                let thumb_h = (track_h * (list_h / total_h)).clamp(16.0, track_h);
+                let thumb_y =
+                    track_top + (track_h - thumb_h) * (scroll_y / max_scroll).clamp(0.0, 1.0);
+                let sb_x =
+                    dip_size.width - metrics::SCROLLBAR_MARGIN_RIGHT - metrics::SCROLLBAR_WIDTH;
+                let thumb_rect = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: sb_x,
+                        top: thumb_y,
+                        right: sb_x + metrics::SCROLLBAR_WIDTH,
+                        bottom: thumb_y + thumb_h,
+                    },
+                    radiusX: 1.5,
+                    radiusY: 1.5,
+                };
+                target.FillRoundedRectangle(&thumb_rect, &ctx.brushes.badge_border);
+            }
+
+            target.PopAxisAlignedClip();
 
             if target.EndDraw(None, None).is_err() {
                 self.context = None;

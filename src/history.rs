@@ -47,6 +47,8 @@ impl History {
         let worker_records = records.clone();
         let worker = std::thread::spawn(move || {
             let mut records = worker_records;
+            let mut serialize_buffer = String::with_capacity(1024);
+
             while let Ok(key) = rx.recv() {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -59,11 +61,25 @@ impl History {
                 entry.count = entry.count.saturating_add(1);
                 entry.last_used = now;
 
-                let mut content = String::with_capacity(records.len() * 32);
-                for (k, rec) in &records {
-                    content.push_str(&format!("{}={}={}\n", k, rec.count, rec.last_used));
+                while let Ok(k) = rx.try_recv() {
+                    let entry = records.entry(k).or_insert(Record {
+                        count: 0,
+                        last_used: now,
+                    });
+                    entry.count = entry.count.saturating_add(1);
+                    entry.last_used = now;
                 }
-                let _ = fs::write(&file_path, content);
+
+                serialize_buffer.clear();
+                for (k, rec) in &records {
+                    serialize_buffer.push_str(k);
+                    serialize_buffer.push('=');
+                    serialize_buffer.push_str(&rec.count.to_string());
+                    serialize_buffer.push('=');
+                    serialize_buffer.push_str(&rec.last_used.to_string());
+                    serialize_buffer.push('\n');
+                }
+                let _ = fs::write(&file_path, &serialize_buffer);
             }
         });
 
@@ -111,7 +127,8 @@ impl History {
                 20
             };
 
-            ((rec.count as i32) * multiplier).min(400)
+            // Cap at 250 so frecency can never cross a tier boundary (minimum gap = 200)
+            ((rec.count as i32) * multiplier).min(250)
         } else {
             0
         }

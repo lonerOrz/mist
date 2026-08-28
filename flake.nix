@@ -21,8 +21,9 @@
 
       pkgs = import nixpkgs {
         inherit system;
+
         overlays = [
-          (import rust-overlay)
+          rust-overlay.overlays.default
         ];
       };
 
@@ -40,17 +41,19 @@
 
     in
     {
-      devShells.${system}.default = pkgs.mkShell {
-        packages = [
+      devShells.${system}.default = pkgs.pkgsCross.mingwW64.mkShell {
+        nativeBuildInputs = [
           rustToolchain
           pkgs.zig
           pkgs.cargo-zigbuild
         ];
 
-        shellHook = ''
-          echo "Rust + Zig Windows cross compile environment"
-          echo "Build: cargo zigbuild --target x86_64-pc-windows-gnu"
-        '';
+        buildInputs = [
+          pkgs.pkgsCross.mingwW64.windows.pthreads
+        ];
+
+        CARGO_BUILD_TARGET = "x86_64-pc-windows-gnu";
+        CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-L native=${pkgs.pkgsCross.mingwW64.windows.pthreads}/lib";
       };
     };
 }

@@ -1,40 +1,48 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 
 pub mod app;
+pub mod clipboard;
 pub mod config;
 pub mod domain;
 pub mod history;
-pub mod pinyin;
-pub mod query;
+pub mod plugins;
 pub mod renderer;
+pub mod router;
 pub mod search;
 pub mod sources;
 
 use app::{App, TIMER_ANIMATION};
-use config::Config;
+use config::{Config, HOTKEY_ID};
 use domain::Item;
 use renderer::{Renderer, metrics, window_scale};
+use std::sync::atomic::{AtomicU16, Ordering};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint};
 use windows::Win32::System::Com::*;
+use windows::Win32::System::DataExchange::{
+    AddClipboardFormatListener, RemoveClipboardFormatListener,
+};
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::*;
+use windows::Win32::UI::Input::Ime::{
+    GCS_COMPSTR, GCS_RESULTSTR, ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
-const HOTKEY_ID: i32 = 1001;
-const HOTKEY_FALLBACK_ID: i32 = 1002;
 const WM_INDEX_READY: u32 = WM_USER + 1;
 const WM_CONFIG_RELOADED: u32 = WM_USER + 2;
+const WM_ACTIVATE_INSTANCE: u32 = WM_USER + 3;
 const TIMER_CARET: usize = 1;
 
-static SURROGATE_PAIR: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+static SURROGATE_PAIR: AtomicU16 = AtomicU16::new(0);
 
 fn parse_hotkey(hotkey_str: &str) -> (HOT_KEY_MODIFIERS, VIRTUAL_KEY) {
     let mut mods = HOT_KEY_MODIFIERS(MOD_NOREPEAT.0);
@@ -49,6 +57,18 @@ fn parse_hotkey(hotkey_str: &str) -> (HOT_KEY_MODIFIERS, VIRTUAL_KEY) {
             "win" | "super" => mods.0 |= MOD_WIN.0,
             "space" => vk = VK_SPACE,
             "tab" => vk = VK_TAB,
+            "f1" => vk = VK_F1,
+            "f2" => vk = VK_F2,
+            "f3" => vk = VK_F3,
+            "f4" => vk = VK_F4,
+            "f5" => vk = VK_F5,
+            "f6" => vk = VK_F6,
+            "f7" => vk = VK_F7,
+            "f8" => vk = VK_F8,
+            "f9" => vk = VK_F9,
+            "f10" => vk = VK_F10,
+            "f11" => vk = VK_F11,
+            "f12" => vk = VK_F12,
             _ => {
                 if let Some(c) = part.chars().next() {
                     let code = c.to_ascii_uppercase() as u16;
@@ -65,17 +85,9 @@ fn parse_hotkey(hotkey_str: &str) -> (HOT_KEY_MODIFIERS, VIRTUAL_KEY) {
 fn apply_hotkeys(hwnd: HWND, hotkey_str: &str) {
     unsafe {
         let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
-        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_FALLBACK_ID);
 
         let (mods, vk) = parse_hotkey(hotkey_str);
-        if RegisterHotKey(Some(hwnd), HOTKEY_ID, mods, vk.0 as u32).is_err() {
-            let _ = RegisterHotKey(
-                Some(hwnd),
-                HOTKEY_FALLBACK_ID,
-                HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_NOREPEAT.0),
-                VK_SPACE.0 as u32,
-            );
-        }
+        let _ = RegisterHotKey(Some(hwnd), HOTKEY_ID, mods, vk.0 as u32);
     }
 }
 
@@ -98,22 +110,36 @@ fn apply_corner(hwnd: HWND, radius: f32) {
 }
 
 fn main() -> Result<()> {
-    unsafe {
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-
-        let _guard = CreateMutexW(None, false, w!("MistLauncherMutex"))?;
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            if let Ok(existing) = FindWindowW(w!("MistLauncherClass"), None) {
-                let _ = PostMessageW(
-                    Some(existing),
-                    WM_HOTKEY,
-                    WPARAM(HOTKEY_ID as usize),
-                    LPARAM(0),
-                );
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--restarted-from"
+            && let Some(pid_str) = args.next()
+            && let Ok(pid) = pid_str.parse::<u32>()
+        {
+            unsafe {
+                if let Ok(process_handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+                    let _ = WaitForSingleObject(process_handle, 5000);
+                    let _ = CloseHandle(process_handle);
+                }
             }
-            return Ok(());
         }
     }
+
+    let mutex_handle = unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+        let mutex_name_wide = domain::to_wide("MistLauncherMutex");
+        let handle = CreateMutexW(None, false, PCWSTR(mutex_name_wide.as_ptr()))?;
+
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            if let Ok(existing) = FindWindowW(w!("MistLauncherClass"), None) {
+                let _ = PostMessageW(Some(existing), WM_ACTIVATE_INSTANCE, WPARAM(0), LPARAM(0));
+            }
+            let _ = CloseHandle(handle);
+            return Ok(());
+        }
+        handle
+    };
 
     if let Ok(home) = std::env::var("USERPROFILE") {
         let _ = std::env::set_current_dir(home);
@@ -121,11 +147,6 @@ fn main() -> Result<()> {
 
     let config = Config::load_or_create();
     crate::config::sync_autostart(config.autostart);
-
-    let args: Vec<String> = std::env::args().collect();
-    let force_show = args
-        .iter()
-        .any(|arg| arg == "--show" || arg == "-s" || arg == "--test");
 
     let hwnd = unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
@@ -231,18 +252,13 @@ fn main() -> Result<()> {
         }
     });
 
-    if force_show {
-        unsafe {
-            toggle_window(hwnd);
-        }
-    }
-
     unsafe {
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).into() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        let _ = CloseHandle(mutex_handle);
         CoUninitialize();
     }
     Ok(())
@@ -260,8 +276,8 @@ unsafe extern "system" fn wnd_proc(
         WM_ERASEBKGND => LRESULT(1),
 
         WM_SETCURSOR => {
-            let hit_test = (lparam.0 & 0xffff) as i32;
-            if hit_test == 1 {
+            let hit_test = (lparam.0 & 0xffff) as u32;
+            if hit_test == HTCLIENT {
                 let mut pt = POINT::default();
                 let _ = unsafe { GetCursorPos(&mut pt) };
                 let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
@@ -298,6 +314,14 @@ unsafe extern "system" fn wnd_proc(
                 let blink = GetCaretBlinkTime();
                 let blink = if blink == 0 { 500 } else { blink };
                 let _ = SetTimer(Some(hwnd), TIMER_CARET, blink, None);
+                let _ = AddClipboardFormatListener(hwnd);
+            }
+            LRESULT(0)
+        }
+
+        WM_CLIPBOARDUPDATE => {
+            if let Some(app) = app_opt {
+                app.clipboard_listener.notify_update();
             }
             LRESULT(0)
         }
@@ -308,9 +332,6 @@ unsafe extern "system" fn wnd_proc(
                 if let Some(app) = app_opt {
                     app.set_index(*boxed);
                     app.on_query_change(hwnd);
-                }
-                unsafe {
-                    let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
                 }
             }
             LRESULT(0)
@@ -344,6 +365,7 @@ unsafe extern "system" fn wnd_proc(
                     );
                 }
                 app.renderer.invalidate();
+                app.update_ime_position(hwnd);
                 let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
             }
             LRESULT(0)
@@ -351,10 +373,17 @@ unsafe extern "system" fn wnd_proc(
 
         WM_HOTKEY => {
             let id = wparam.0 as i32;
-            if id == HOTKEY_ID || id == HOTKEY_FALLBACK_ID {
+            if id == HOTKEY_ID {
                 unsafe {
                     toggle_window(hwnd);
                 }
+            }
+            LRESULT(0)
+        }
+
+        WM_ACTIVATE_INSTANCE => {
+            unsafe {
+                toggle_window(hwnd);
             }
             LRESULT(0)
         }
@@ -363,14 +392,15 @@ unsafe extern "system" fn wnd_proc(
             if let Some(app) = app_opt {
                 let code = wparam.0 as u16;
                 if (0xD800..=0xDBFF).contains(&code) {
-                    SURROGATE_PAIR.store(code, std::sync::atomic::Ordering::Relaxed);
+                    SURROGATE_PAIR.store(code, Ordering::Relaxed);
                 } else {
                     let full_char = if (0xDC00..=0xDFFF).contains(&code)
-                        && SURROGATE_PAIR.load(std::sync::atomic::Ordering::Relaxed) != 0
+                        && SURROGATE_PAIR.load(Ordering::Relaxed) != 0
                     {
-                        let high = SURROGATE_PAIR.swap(0, std::sync::atomic::Ordering::Relaxed);
+                        let high = SURROGATE_PAIR.swap(0, Ordering::Relaxed);
                         char::decode_utf16([high, code]).next().and_then(|r| r.ok())
                     } else {
+                        SURROGATE_PAIR.store(0, Ordering::Relaxed);
                         char::from_u32(code as u32)
                     };
 
@@ -434,7 +464,87 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
 
+        WM_IME_STARTCOMPOSITION => {
+            SURROGATE_PAIR.store(0, Ordering::Relaxed);
+            if let Some(app) = app_opt {
+                app.ime_comp.clear();
+                app.update_ime_position(hwnd);
+            }
+            LRESULT(0)
+        }
+
+        WM_IME_COMPOSITION => {
+            if let Some(app) = app_opt {
+                let himc = unsafe { ImmGetContext(hwnd) };
+                if !himc.0.is_null() {
+                    let lparam_u32 = lparam.0 as u32;
+
+                    if (lparam_u32 & GCS_RESULTSTR.0) != 0 {
+                        let len = unsafe { ImmGetCompositionStringW(himc, GCS_RESULTSTR, None, 0) };
+                        if len > 0 {
+                            let mut buf = vec![0u16; (len as usize) / 2];
+                            let _ = unsafe {
+                                ImmGetCompositionStringW(
+                                    himc,
+                                    GCS_RESULTSTR,
+                                    Some(buf.as_mut_ptr() as *mut _),
+                                    len as u32,
+                                )
+                            };
+                            let result_str = String::from_utf16_lossy(&buf);
+                            app.query.push_str(&result_str);
+                            app.ime_comp.clear();
+                            app.on_query_change(hwnd);
+                        }
+                    } else if (lparam_u32 & GCS_COMPSTR.0) != 0 {
+                        let len = unsafe { ImmGetCompositionStringW(himc, GCS_COMPSTR, None, 0) };
+                        if len > 0 {
+                            let mut buf = vec![0u16; (len as usize) / 2];
+                            let _ = unsafe {
+                                ImmGetCompositionStringW(
+                                    himc,
+                                    GCS_COMPSTR,
+                                    Some(buf.as_mut_ptr() as *mut _),
+                                    len as u32,
+                                )
+                            };
+                            app.ime_comp = String::from_utf16_lossy(&buf);
+                        } else {
+                            app.ime_comp.clear();
+                        }
+                        app.update_ime_position(hwnd);
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    }
+
+                    unsafe {
+                        let _ = ImmReleaseContext(hwnd, himc);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+
+        WM_IME_ENDCOMPOSITION => {
+            if let Some(app) = app_opt {
+                app.ime_comp.clear();
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            LRESULT(0)
+        }
+
+        WM_SETFOCUS => {
+            if let Some(app) = app_opt {
+                app.update_ime_position(hwnd);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
         WM_KILLFOCUS => {
+            SURROGATE_PAIR.store(0, Ordering::Relaxed);
             if let Some(app) = app_opt {
                 app.hide(hwnd);
             }
@@ -511,6 +621,14 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
 
+        WM_MOUSEWHEEL => {
+            if let Some(app) = app_opt {
+                let delta = ((wparam.0 >> 16) & 0xffff) as i16;
+                app.on_mouse_wheel(hwnd, delta);
+            }
+            LRESULT(0)
+        }
+
         WM_PAINT => {
             if let Some(app) = app_opt {
                 app.render_current_frame(hwnd);
@@ -528,7 +646,7 @@ unsafe extern "system" fn wnd_proc(
                     &mut pending,
                     Some(hwnd),
                     WM_INDEX_READY,
-                    WM_CONFIG_RELOADED,
+                    WM_ACTIVATE_INSTANCE,
                     PM_REMOVE,
                 )
                 .into()
@@ -547,9 +665,9 @@ unsafe extern "system" fn wnd_proc(
                 }
 
                 let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
-                let _ = UnregisterHotKey(Some(hwnd), HOTKEY_FALLBACK_ID);
                 let _ = KillTimer(Some(hwnd), TIMER_CARET);
                 let _ = KillTimer(Some(hwnd), TIMER_ANIMATION);
+                let _ = RemoveClipboardFormatListener(hwnd);
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
                 if !ptr.is_null() {
                     drop(Box::from_raw(ptr));
@@ -561,6 +679,28 @@ unsafe extern "system" fn wnd_proc(
         }
 
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+fn get_target_monitor_rect() -> RECT {
+    unsafe {
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut mi).as_bool() {
+            mi.rcWork
+        } else {
+            RECT {
+                left: 0,
+                top: 0,
+                right: GetSystemMetrics(SM_CXSCREEN),
+                bottom: GetSystemMetrics(SM_CYSCREEN),
+            }
+        }
     }
 }
 
@@ -578,39 +718,61 @@ unsafe fn toggle_window(hwnd: HWND) {
             if !ptr.is_null() {
                 let app = &mut *ptr;
                 app.query.clear();
+                app.ime_comp.clear();
                 app.results.clear();
                 app.selected = 0;
                 app.hovered = None;
                 app.caret_visible = true;
                 app.height_spring.reset(metrics::HEADER_HEIGHT as f32);
                 app.pill.reset(metrics::LIST_TOP);
+                app.scroll_spring.reset(0.0);
+
+                let blink = GetCaretBlinkTime();
+                let blink = if blink == 0 { 500 } else { blink };
+                let _ = SetTimer(Some(hwnd), TIMER_CARET, blink, None);
 
                 let s = window_scale(hwnd);
+                let work_area = get_target_monitor_rect();
+                let work_w = work_area.right - work_area.left;
+                let work_h = work_area.bottom - work_area.top;
+                let win_w = (app.config.width as f32 * s).round() as i32;
+                let win_h = (metrics::HEADER_HEIGHT as f32 * s).round() as i32;
+                let x = work_area.left + (work_w - win_w) / 2;
+                let y = work_area.top + (work_h - win_h) / 3;
+
                 let _ = SetWindowPos(
                     hwnd,
                     Some(HWND_TOPMOST),
-                    0,
-                    0,
-                    (app.config.width as f32 * s).round() as i32,
-                    (metrics::HEADER_HEIGHT as f32 * s).round() as i32,
-                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+                    x,
+                    y,
+                    win_w,
+                    win_h,
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
                 );
 
                 let items: Vec<&Item> = app.results.iter().collect();
                 let _ = app.renderer.render(
                     hwnd,
-                    &app.query,
+                    &app.display_query(),
                     &app.config.placeholder,
                     &items,
                     app.selected,
                     app.caret_visible,
                     app.hovered,
                     app.pill.current,
+                    app.config.max_results,
+                    app.scroll_spring.current,
                 );
             }
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = SetForegroundWindow(hwnd);
             let _ = SetFocus(Some(hwnd));
+
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+            if !ptr.is_null() {
+                let app = &mut *ptr;
+                app.update_ime_position(hwnd);
+            }
         }
     }
 }
