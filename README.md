@@ -7,6 +7,7 @@ A lightweight Windows launcher written in Rust.
 - Application indexing from Start Menu, Desktop, UWP apps, and App Paths.
 - Sub-string, acronym, and Pinyin search with frecency scoring.
 - Plugin-based architecture with explicit prefix routing.
+- Clipboard history manager with move-to-front dedup and file/text support.
 - Direct2D rendering with acrylic backdrop and spring animations.
 
 ## Prefixes & Plugins
@@ -19,7 +20,11 @@ A lightweight Windows launcher written in Rust.
 | `!`      | Web Search | Search engines (Bang syntax)  | `!gh rust`, `!g ai`           |
 | `/sys`   | System     | System power operations       | `/sys lock`, `/sys shutdown`  |
 | `/app`   | App Mgmt   | Manage Mist itself            | `/app config`, `/app restart` |
+| `/cb`    | Clipboard  | Paste from clipboard history  | `/cb`, `/cb config`           |
 | _(auto)_ | Path       | Open file explorer            | `C:\Windows`                  |
+
+The `/cb` plugin shows recent clipboard entries (text and files) with an optional filter;
+pressing `Enter` pastes the selected entry back into the active window.
 
 ## Shortcuts
 
