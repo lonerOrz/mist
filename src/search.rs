@@ -5,24 +5,21 @@ use std::sync::OnceLock;
 
 static MATCHER: OnceLock<SkimMatcherV2> = OnceLock::new();
 
+/// Returns a shared static instance of the Skim fuzzy matcher.
 fn get_matcher() -> &'static SkimMatcherV2 {
     MATCHER.get_or_init(SkimMatcherV2::default)
 }
 
-/// Tiered scoring model:
-///   Tier 1 (exact):    2000 Name / 1800 Pinyin / 1700 Alias / 1400 Initials
-///   Tier 2 (prefix):   1200 Name / 1100 Alias / 1000 Pinyin /  800 Initials
-///   Tier 4 (fuzzy):     200-600 (varies by key type + 0–200 normalized bonus)
-/// Frecency is capped at 250 so it can never cross tier boundaries.
 impl KeyKind {
+    /// Computes the matching score of an indexing key against raw and normalized queries.
     #[inline]
     pub fn score(&self, text: &str, q: &str, q_norm: &str) -> Option<i32> {
         if text.is_empty() || q.is_empty() {
             return None;
         }
 
-        // Exact match — try raw text first, then space-normalized for Pinyin
-        if text == q || *self == KeyKind::Pinyin && q_norm == q && text == q_norm {
+        // Exact match
+        if text == q || (*self == KeyKind::Pinyin && q_norm == q && text == q_norm) {
             return Some(match self {
                 KeyKind::Name => 2000,
                 KeyKind::Pinyin => 1800,
@@ -55,7 +52,7 @@ impl KeyKind {
             return Some(base + normalized.min(200));
         }
 
-        // Fuzzy fallback: match query (with spaces) against stored pinyin (no spaces)
+        // Fuzzy fallback for Pinyin keys (query without spaces against joined pinyin)
         if *self == KeyKind::Pinyin
             && q != q_norm
             && let Some(s) = get_matcher().fuzzy_match(text, q_norm).filter(|&s| s > 0)
@@ -68,23 +65,22 @@ impl KeyKind {
     }
 }
 
+/// Matches an item against query strings, returning the highest scoring match with frecency applied.
+#[inline]
 pub fn match_item<'a>(
     item: &'a Item,
-    _query: &str,
     query_lower: &str,
+    q_norm: &str,
     frecency_score: i32,
 ) -> Option<Match<'a>> {
     if query_lower.is_empty() {
         return None;
     }
 
-    // Strip spaces once for pinyin keys — no allocation in the hot loop
-    let q_norm: String = query_lower.chars().filter(|&c| c != ' ').collect();
-
     let base_score = item
         .keys
         .iter()
-        .filter_map(|(kind, key)| kind.score(key, query_lower, &q_norm))
+        .filter_map(|(kind, key)| kind.score(key, query_lower, q_norm))
         .max()?;
 
     Some(Match {
@@ -106,35 +102,34 @@ mod tests {
             r"C:\System32\Taskmgr.exe",
         );
 
-        // Initials: "vsc" matches VSCode initials exactly → 1400
+        // Initials exact match
         assert_eq!(match_item(&vscode, "vsc", "vsc", 0).unwrap().score, 1400);
-        // Alias exact: "code" → Alias "code" = 1700
+        // Alias exact match
         assert_eq!(match_item(&vscode, "code", "code", 0).unwrap().score, 1700);
 
         // Pinyin exact and prefix
         assert_eq!(match_item(&wx, "weixin", "weixin", 0).unwrap().score, 1800);
         assert!(match_item(&wx, "weix", "weix", 0).is_some());
-        // Initials exact: "wx" → 1400
+        // Initials exact
         assert_eq!(match_item(&wx, "wx", "wx", 0).unwrap().score, 1400);
 
-        // Initials match for Chinese
+        // Initials match for Chinese characters
         assert!(match_item(&taskmgr, "rwglq", "rwglq", 0).is_some());
 
-        // ASCII initials (Node.js)
+        // ASCII initials
         let nj = Item::new_application("Node.js", r"C:\node.exe");
         assert_eq!(match_item(&nj, "nj", "nj", 0).unwrap().score, 1400);
 
-        // Frecency bonus (capped at 250 in history, tested with raw value)
+        // Frecency bonus
         assert_eq!(match_item(&wx, "wx", "wx", 50).unwrap().score, 1450);
 
-        // Chrome: "c" matches Alias "chrome" as prefix → 1100 + bonus + frecency
+        // Prefix alias match
         let chrome = Item::new_application("Google Chrome", r"C:\chrome.exe");
         let chrome_match = match_item(&chrome, "c", "c", 400);
         assert!(chrome_match.is_some());
-        // Prefix alias (1100) + bonus (200) + frecency (400) = 1700 < 2000 (exact name)
         assert!(chrome_match.unwrap().score < 2000);
 
-        // No match
+        // Negative match
         assert!(match_item(&wx, "qq", "qq", 0).is_none());
     }
 
@@ -153,24 +148,19 @@ mod tests {
             &["quit", "close", ":q"],
         );
 
-        // "conf" fuzzy-matches Alias "configuration" → score > 0
         assert!(match_item(&cfg, "conf", "conf", 0).is_some());
-        // "settings" matches Alias exactly → 1700
         assert_eq!(
             match_item(&cfg, "settings", "settings", 0).unwrap().score,
             1700
         );
         assert!(cfg.is_name_exact("config"));
         assert!(!cfg.is_name_exact("settings"));
-
-        // ":q" matches Alias exactly → 1700
         assert_eq!(match_item(&exit, ":q", ":q", 0).unwrap().score, 1700);
 
         let calc = Item::new_calculator("7");
         assert!(match_item(&calc, "7", "7", 0).is_none());
 
         let uwp = Item::new_application("Photos", r"shell:AppsFolder\abc.def");
-        // shell: paths have no Alias; only Name key "photos"
         assert_eq!(uwp.keys.len(), 1);
     }
 }

@@ -16,6 +16,7 @@ use windows::core::*;
 pub static IS_INTERNAL_COPY: AtomicBool = AtomicBool::new(false);
 static ENTRY_ID_GEN: AtomicU64 = AtomicU64::new(1);
 
+/// Payload variant representing text or file list copied to clipboard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardPayload {
     Text {
@@ -30,6 +31,7 @@ pub enum ClipboardPayload {
     },
 }
 
+/// Timestamped clipboard entry with unique monotonic ID.
 #[derive(Debug, Clone)]
 pub struct ClipboardEntry {
     pub id: u64,
@@ -37,12 +39,14 @@ pub struct ClipboardEntry {
     pub payload: ClipboardPayload,
 }
 
+/// Background worker that debounces and captures clipboard content changes.
 pub struct ClipboardListener {
     tx: Sender<()>,
     pub rx: Receiver<ClipboardEntry>,
 }
 
 impl ClipboardListener {
+    /// Creates and spawns the background clipboard listener worker.
     pub fn new() -> Self {
         let (ping_tx, ping_rx) = channel::<()>();
         let (data_tx, data_rx) = channel::<ClipboardEntry>();
@@ -50,14 +54,12 @@ impl ClipboardListener {
         thread::spawn(move || {
             let mut last_hash: u64 = 0;
 
-            // capture current clipboard once at startup
             if let Some(entry) = try_capture_clipboard_with_retry() {
                 last_hash = calculate_entry_hash(&entry);
                 let _ = data_tx.send(entry);
             }
 
             while ping_rx.recv().is_ok() {
-                // debounce: wait 30ms to gather all clipboard changes from one burst
                 let start = std::time::Instant::now();
                 while ping_rx.recv_timeout(Duration::from_millis(30)).is_ok() {
                     if start.elapsed() > Duration::from_millis(150) {
@@ -65,7 +67,6 @@ impl ClipboardListener {
                     }
                 }
 
-                // skip if the app itself wrote to the clipboard (avoid echo loop)
                 if IS_INTERNAL_COPY.swap(false, Ordering::SeqCst) {
                     continue;
                 }
@@ -86,6 +87,7 @@ impl ClipboardListener {
         }
     }
 
+    /// Notifies the worker thread that a WM_CLIPBOARDUPDATE event occurred.
     pub fn notify_update(&self) {
         let _ = self.tx.send(());
     }
@@ -97,10 +99,7 @@ impl Default for ClipboardListener {
     }
 }
 
-pub fn try_capture_clipboard_now() -> Option<ClipboardEntry> {
-    capture_clipboard()
-}
-
+/// Captures the current clipboard content with multiple retry attempts.
 fn try_capture_clipboard_with_retry() -> Option<ClipboardEntry> {
     for _ in 0..5 {
         if let Some(entry) = capture_clipboard() {
@@ -111,6 +110,7 @@ fn try_capture_clipboard_with_retry() -> Option<ClipboardEntry> {
     None
 }
 
+/// Reads CF_HDROP files or CF_UNICODETEXT from the system clipboard.
 fn capture_clipboard() -> Option<ClipboardEntry> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -118,28 +118,15 @@ fn capture_clipboard() -> Option<ClipboardEntry> {
         .as_secs();
     let id = ENTRY_ID_GEN.fetch_add(1, Ordering::Relaxed);
 
+    let _guard = crate::domain::ClipboardGuard::open()?;
+
     unsafe {
-        if OpenClipboard(None).is_err() {
-            return None;
-        }
-
-        struct ClipGuard;
-        impl Drop for ClipGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    let _ = CloseClipboard();
-                }
-            }
-        }
-        let _guard = ClipGuard;
-
-        // password-manager privacy marker (1Password / Bitwarden / KeePass)
         let ignore_format = RegisterClipboardFormatW(w!("Clipboard Viewer Ignore"));
         if ignore_format != 0 && IsClipboardFormatAvailable(ignore_format).is_ok() {
             return None;
         }
 
-        // extract files (CF_HDROP)
+        // 1. Files payload (CF_HDROP)
         if IsClipboardFormatAvailable(CF_HDROP.0 as u32).is_ok()
             && let Ok(handle) = GetClipboardData(CF_HDROP.0 as u32)
         {
@@ -181,7 +168,7 @@ fn capture_clipboard() -> Option<ClipboardEntry> {
             }
         }
 
-        // extract text (CF_UNICODETEXT) (same unsafe block, ClipGuard still holds clipboard)
+        // 2. Text payload (CF_UNICODETEXT)
         if IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32).is_ok()
             && let Ok(handle) = GetClipboardData(CF_UNICODETEXT.0 as u32)
             && !handle.0.is_null()
@@ -227,6 +214,7 @@ fn capture_clipboard() -> Option<ClipboardEntry> {
     None
 }
 
+/// Calculates a hash value for deduplicating clipboard entries.
 pub fn calculate_entry_hash(entry: &ClipboardEntry) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     match &entry.payload {
