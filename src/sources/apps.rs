@@ -7,6 +7,7 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 use windows::core::*;
 
+/// Runs a closure inside a multithreaded COM apartment scope.
 fn scoped_com<T>(f: impl FnOnce() -> T) -> T {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -18,22 +19,26 @@ fn scoped_com<T>(f: impl FnOnce() -> T) -> T {
     r
 }
 
-pub fn scan_all() -> Vec<Item> {
-    let (startmenu, uwp, app_paths) = std::thread::scope(|s| {
+/// Scans Start Menu, Desktop, UWP apps, App Paths, and custom directories concurrently.
+pub fn scan_all(extra_paths: &[PathBuf]) -> Vec<Item> {
+    let (startmenu, uwp, app_paths, custom) = std::thread::scope(|s| {
         let b = s.spawn(|| scoped_com(scan_start_menu_and_desktop));
         let c = s.spawn(|| scoped_com(scan_uwp_apps));
         let d = s.spawn(scan_app_paths);
+        let e = s.spawn(|| scan_custom_paths(extra_paths));
         (
             b.join().unwrap_or_default(),
             c.join().unwrap_or_default(),
             d.join().unwrap_or_default(),
+            e.join().unwrap_or_default(),
         )
     });
 
-    let mut items = Vec::with_capacity(startmenu.len() + uwp.len() + app_paths.len());
+    let mut items =
+        Vec::with_capacity(startmenu.len() + uwp.len() + app_paths.len() + custom.len());
     let mut seen_keys: HashSet<Box<str>> = HashSet::new();
 
-    for source in [startmenu, uwp, app_paths] {
+    for source in [startmenu, uwp, app_paths, custom] {
         for item in source {
             if seen_keys.insert(item.name.to_lowercase().into_boxed_str()) {
                 items.push(item);
@@ -43,6 +48,7 @@ pub fn scan_all() -> Vec<Item> {
     items
 }
 
+/// Expands %VARIABLE% environment variables in a path string.
 fn expand_env(s: &str) -> String {
     if !s.contains('%') {
         return s.to_string();
@@ -57,6 +63,40 @@ fn expand_env(s: &str) -> String {
     }
 }
 
+/// Scans user-configured extra directories for scripts and executables.
+fn scan_custom_paths(paths: &[PathBuf]) -> Vec<Item> {
+    let mut items = Vec::new();
+    for p in paths {
+        let expanded = expand_env(&p.to_string_lossy());
+        let target_dir = Path::new(&expanded);
+        if target_dir.is_dir() {
+            walk_custom_directory(target_dir, &mut items, 0);
+        }
+    }
+    items
+}
+
+/// Recursively scans custom directories up to a maximum depth of 3 levels.
+fn walk_custom_directory(dir: &Path, out: &mut Vec<Item>, depth: usize) {
+    if depth > 3 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_custom_directory(&path, out, depth + 1);
+        } else if is_valid_executable(&path)
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        {
+            out.push(Item::new_application(stem, path.to_string_lossy().as_ref()));
+        }
+    }
+}
+
+/// Reads a string value from the Windows registry.
 fn read_reg_string(hkey: HKEY, subkey: PCWSTR, value_name: PCWSTR) -> Result<String> {
     unsafe {
         let mut key = HKEY::default();
@@ -82,6 +122,7 @@ fn read_reg_string(hkey: HKEY, subkey: PCWSTR, value_name: PCWSTR) -> Result<Str
     }
 }
 
+/// Enumerates registered applications under HKLM and HKCU App Paths.
 fn scan_app_paths() -> Vec<Item> {
     let mut items = Vec::new();
     for hkey in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
@@ -129,6 +170,7 @@ fn scan_app_paths() -> Vec<Item> {
     items
 }
 
+/// Enumerates subkey names under a given registry key.
 fn enum_reg_keys(hkey: HKEY, subkey: &str) -> Option<Vec<String>> {
     unsafe {
         let sub_w = to_wide(subkey);
@@ -167,9 +209,20 @@ fn enum_reg_keys(hkey: HKEY, subkey: &str) -> Option<Vec<String>> {
     }
 }
 
-/// Lightweight extension check — no disk I/O or COM resolution
+/// Validates whether a file path has an executable or runnable script extension.
 fn is_valid_executable(path: &Path) -> bool {
-    const VALID_EXTS: &[&str] = &["lnk", "exe", "bat", "cmd", "msc", "cpl", "appref-ms", "url"];
+    const VALID_EXTS: &[&str] = &[
+        "lnk",
+        "exe",
+        "bat",
+        "cmd",
+        "msc",
+        "cpl",
+        "appref-ms",
+        "url",
+        "ps1",
+        "vbs",
+    ];
 
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
@@ -177,6 +230,7 @@ fn is_valid_executable(path: &Path) -> bool {
     VALID_EXTS.iter().any(|&v| v.eq_ignore_ascii_case(ext))
 }
 
+/// Scans all user and common Start Menu / Desktop directories.
 fn scan_start_menu_and_desktop() -> Vec<Item> {
     let mut items = Vec::new();
     for id in [
@@ -194,6 +248,7 @@ fn scan_start_menu_and_desktop() -> Vec<Item> {
     items
 }
 
+/// Retrieves the filesystem path for a Windows Known Folder GUID.
 fn known_folder_path(id: &GUID) -> Option<PathBuf> {
     unsafe {
         let path = SHGetKnownFolderPath(id, KNOWN_FOLDER_FLAG(0), None).ok()?;
@@ -203,6 +258,7 @@ fn known_folder_path(id: &GUID) -> Option<PathBuf> {
     }
 }
 
+/// Recursively traverses a folder hierarchy up to depth 6 to collect executable files.
 fn walk_directory(dir: &Path, out: &mut Vec<Item>, depth: usize) {
     if depth > 6 {
         return;
@@ -223,6 +279,7 @@ fn walk_directory(dir: &Path, out: &mut Vec<Item>, depth: usize) {
     }
 }
 
+/// Enumerates packaged UWP applications via shell:AppsFolder.
 fn scan_uwp_apps() -> Vec<Item> {
     let mut items = Vec::new();
     unsafe {

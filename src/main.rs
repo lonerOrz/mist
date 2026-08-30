@@ -5,9 +5,8 @@ pub mod clipboard;
 pub mod config;
 pub mod domain;
 pub mod history;
-pub mod plugins;
+pub mod query;
 pub mod renderer;
-pub mod router;
 pub mod search;
 pub mod sources;
 
@@ -44,6 +43,7 @@ const TIMER_CARET: usize = 1;
 
 static SURROGATE_PAIR: AtomicU16 = AtomicU16::new(0);
 
+/// Parses a shortcut string into Windows modifier flags and virtual key code.
 fn parse_hotkey(hotkey_str: &str) -> (HOT_KEY_MODIFIERS, VIRTUAL_KEY) {
     let mut mods = HOT_KEY_MODIFIERS(MOD_NOREPEAT.0);
     let parts: Vec<&str> = hotkey_str.split('+').map(|s| s.trim()).collect();
@@ -82,15 +82,16 @@ fn parse_hotkey(hotkey_str: &str) -> (HOT_KEY_MODIFIERS, VIRTUAL_KEY) {
     (mods, vk)
 }
 
+/// Registers the global system hotkey for summoning the launcher window.
 fn apply_hotkeys(hwnd: HWND, hotkey_str: &str) {
     unsafe {
         let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
-
         let (mods, vk) = parse_hotkey(hotkey_str);
         let _ = RegisterHotKey(Some(hwnd), HOTKEY_ID, mods, vk.0 as u32);
     }
 }
 
+/// Configures Windows DWM rounded corner preferences based on radius setting.
 fn apply_corner(hwnd: HWND, radius: f32) {
     let pref = if radius >= 6.0 {
         DWMWCP_ROUND
@@ -109,6 +110,7 @@ fn apply_corner(hwnd: HWND, radius: f32) {
     };
 }
 
+/// Application entry point: initializes Win32 subsystem, DPI awareness, DWM acrylic window, and starts message pump.
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -224,6 +226,7 @@ fn main() -> Result<()> {
     };
 
     let renderer = Renderer::new(config.font_family.clone())?;
+    let initial_extra_paths = config.extra_paths.clone();
     let app = Box::new(App::new(renderer, config));
 
     unsafe {
@@ -234,7 +237,7 @@ fn main() -> Result<()> {
 
     let hwnd_raw = hwnd.0 as isize;
     std::thread::spawn(move || {
-        let items = sources::apps::scan_all();
+        let items = sources::apps::scan_all(&initial_extra_paths);
         let boxed_items = Box::new(items);
         let target_hwnd = HWND(hwnd_raw as *mut _);
         let raw = Box::into_raw(boxed_items);
@@ -264,6 +267,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Primary window procedure handling Win32 messages, input routing, and rendering triggers.
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -344,7 +348,31 @@ unsafe extern "system" fn wnd_proc(
                 apply_corner(hwnd, boxed.corner_radius);
                 apply_hotkeys(hwnd, &boxed.hotkey);
                 if let Some(app) = app_opt {
+                    let extra_paths_changed = app.config.extra_paths != boxed.extra_paths;
+                    let new_extra_paths = boxed.extra_paths.clone();
                     app.update_config(hwnd, *boxed);
+
+                    if extra_paths_changed {
+                        let hwnd_raw = hwnd.0 as isize;
+                        std::thread::spawn(move || {
+                            let items = sources::apps::scan_all(&new_extra_paths);
+                            let boxed_items = Box::new(items);
+                            let target_hwnd = HWND(hwnd_raw as *mut _);
+                            let raw = Box::into_raw(boxed_items);
+                            unsafe {
+                                if PostMessageW(
+                                    Some(target_hwnd),
+                                    WM_INDEX_READY,
+                                    WPARAM(0),
+                                    LPARAM(raw as isize),
+                                )
+                                .is_err()
+                                {
+                                    drop(Box::from_raw(raw));
+                                }
+                            }
+                        });
+                    }
                 }
             }
             LRESULT(0)
@@ -682,6 +710,7 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
+/// Retrieves the working area bounds for the monitor nearest to the mouse cursor.
 fn get_target_monitor_rect() -> RECT {
     unsafe {
         let mut pt = POINT::default();
@@ -704,6 +733,7 @@ fn get_target_monitor_rect() -> RECT {
     }
 }
 
+/// Toggles launcher window visibility, centering it on the target display when shown.
 unsafe fn toggle_window(hwnd: HWND) {
     unsafe {
         let is_visible = IsWindowVisible(hwnd).as_bool();

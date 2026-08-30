@@ -5,12 +5,14 @@ use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Single item launch count and timestamp record.
 #[derive(Debug, Clone, Copy)]
 pub struct Record {
     pub count: u32,
     pub last_used: u64,
 }
 
+/// In-memory frecency manager backed by asynchronous file persistence.
 pub struct History {
     records: HashMap<String, Record>,
     sender: Option<Sender<String>>,
@@ -27,6 +29,7 @@ impl Drop for History {
 }
 
 impl History {
+    /// Loads historical launch records from disk and starts the persistence background worker.
     pub fn load() -> Self {
         let file_path = config::get_mist_dir().join("history.txt");
 
@@ -90,6 +93,7 @@ impl History {
         }
     }
 
+    /// Records an execution event for the given item key and syncs to disk asynchronously.
     pub fn record_launch(&mut self, key: &str) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -109,6 +113,7 @@ impl History {
         }
     }
 
+    /// Computes the frecency bonus score decayed by age (capped at 250).
     pub fn get_score(&self, key: &str) -> i32 {
         if let Some(rec) = self.records.get(key) {
             let now = SystemTime::now()
@@ -127,7 +132,6 @@ impl History {
                 20
             };
 
-            // Cap at 250 so frecency can never cross a tier boundary (minimum gap = 200)
             ((rec.count as i32) * multiplier).min(250)
         } else {
             0

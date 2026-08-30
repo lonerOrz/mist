@@ -15,6 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::*;
 use windows_numerics::Vector2;
 
+/// Layout and geometry constants in DIP units.
 pub mod metrics {
     pub const HEADER_HEIGHT: i32 = 56;
     pub const ITEM_HEIGHT: i32 = 54;
@@ -25,11 +26,13 @@ pub mod metrics {
     pub const SCROLLBAR_WIDTH: f32 = 3.0;
     pub const SCROLLBAR_MARGIN_RIGHT: f32 = 4.0;
 
+    /// Returns the top Y position of a list item by row index.
     #[inline]
     pub fn list_item_top(idx: usize) -> f32 {
         LIST_TOP + (idx as f32) * ITEM_HEIGHT as f32
     }
 
+    /// Checks if a coordinate falls inside the Administrator action badge zone.
     #[inline]
     pub fn is_in_admin_button(idx: usize, width: f32, x: f32, y: f32) -> bool {
         let row_top = list_item_top(idx);
@@ -41,6 +44,7 @@ pub mod metrics {
     }
 }
 
+/// Visual theme and layout dimensions derived from configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
     pub width: i32,
@@ -51,6 +55,7 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// Builds a Theme configuration instance.
     pub fn from_config(config: &crate::config::Config) -> Self {
         let r = config.corner_radius;
         Self {
@@ -101,6 +106,7 @@ const ICON_CLIP: BadgeGlyphs = BadgeGlyphs {
     fluent: w!("\u{e77f}"),
 };
 
+/// Selects glyph string based on whether Nerd Font support is active.
 fn pick_glyph(g: &BadgeGlyphs, is_nerd: bool) -> &[u16] {
     unsafe {
         if is_nerd {
@@ -110,15 +116,18 @@ fn pick_glyph(g: &BadgeGlyphs, is_nerd: bool) -> &[u16] {
         }
     }
 }
+
 const KEY_CAP_COPY: PCWSTR = w!("↵ Copy");
 const KEY_CAP_PASTE: PCWSTR = w!("↵ Paste");
 const KEY_CAP_OPEN: PCWSTR = w!("↵ Open");
 const KEY_CAP_ADMIN: PCWSTR = w!("Shift+↵ Admin");
 
+/// Calculates window DPI scaling factor relative to 96 DPI.
 pub fn window_scale(hwnd: HWND) -> f32 {
     (unsafe { GetDpiForWindow(hwnd) as f32 }) / 96.0
 }
 
+/// Checks if a font family is installed in the system DirectWrite collection.
 fn family_exists(dwrite_factory: &IDWriteFactory, family: PCWSTR) -> bool {
     unsafe {
         let mut collection: Option<IDWriteFontCollection> = None;
@@ -140,6 +149,7 @@ fn family_exists(dwrite_factory: &IDWriteFactory, family: PCWSTR) -> bool {
     }
 }
 
+/// Probes whether the configured font supports Nerd Font glyph codepoints.
 fn probe_nerd_font_support(dwrite_factory: &IDWriteFactory, font_family: &str) -> bool {
     let lower = font_family.to_lowercase();
     if lower.contains("nerd") || lower.contains(" nf") || lower.ends_with("nf") {
@@ -204,6 +214,7 @@ fn probe_nerd_font_support(dwrite_factory: &IDWriteFactory, font_family: &str) -
     }
 }
 
+/// LRU icon cache backed by Windows Imaging Component (WIC).
 pub struct IconCache {
     wic_factory: IWICImagingFactory,
     cache: HashMap<Arc<str>, (Option<ID2D1Bitmap>, u64)>,
@@ -212,6 +223,7 @@ pub struct IconCache {
 }
 
 impl IconCache {
+    /// Creates a new IconCache instance.
     pub fn new() -> Result<Self> {
         let wic_factory: IWICImagingFactory =
             unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)? };
@@ -223,9 +235,11 @@ impl IconCache {
         })
     }
 
+    /// Retrieves an icon bitmap from cache or loads it from the shell.
+    ///
     /// # Safety
     ///
-    /// `rt` must be a valid and initialized Direct2D render target on the UI thread.
+    /// `rt` must be a valid Direct2D render target initialized on the current UI thread.
     pub unsafe fn get_or_load(
         &mut self,
         rt: &ID2D1RenderTarget,
@@ -248,7 +262,6 @@ impl IconCache {
         self.loading.remove(&key);
         self.cache.insert(key, (loaded.clone(), current_tick));
 
-        // real LRU eviction: once cache exceeds 512, evict the 256 oldest by access tick
         if self.cache.len() > 512 {
             let mut entries: Vec<(Arc<str>, u64)> = self
                 .cache
@@ -263,6 +276,7 @@ impl IconCache {
         loaded
     }
 
+    /// Loads an HICON via SHGetFileInfoW and converts it to a Direct2D bitmap.
     unsafe fn load_shell_icon(
         &self,
         rt: &ID2D1RenderTarget,
@@ -305,9 +319,7 @@ impl IconCache {
     }
 }
 
-/// # Safety
-///
-/// All D2D/DWrite parameters must be valid objects on the UI thread.
+/// Renders a glyph icon centered inside a badge rectangle.
 unsafe fn draw_badge_icon(
     target: &ID2D1RenderTarget,
     dwrite_factory: &IDWriteFactory,
@@ -349,9 +361,7 @@ unsafe fn draw_badge_icon(
     }
 }
 
-/// # Safety
-///
-/// All brush/format/target parameters must be valid D2D objects on the UI thread.
+/// Renders a filled, bordered rounded rectangle containing a glyph icon.
 #[allow(clippy::too_many_arguments)]
 unsafe fn draw_badge(
     target: &ID2D1RenderTarget,
@@ -417,6 +427,7 @@ pub struct D2DContext {
     is_nerd_font: bool,
 }
 
+/// Spring animation physics state container.
 #[derive(Debug, Clone, Copy)]
 pub struct Spring {
     pub current: f32,
@@ -427,6 +438,7 @@ pub struct Spring {
 }
 
 impl Spring {
+    /// Creates a fast spring with default response time.
     pub const fn new(initial: f32) -> Self {
         Self {
             current: initial,
@@ -437,6 +449,7 @@ impl Spring {
         }
     }
 
+    /// Creates a slow spring with a custom response time.
     pub fn new_slow(initial: f32, response: f32) -> Self {
         Self {
             current: initial,
@@ -447,16 +460,19 @@ impl Spring {
         }
     }
 
+    /// Sets the target destination value for the spring.
     pub fn set_target(&mut self, target: f32) {
         self.target = target;
     }
 
+    /// Immediately resets the spring position and velocity to a fixed value.
     pub fn reset(&mut self, val: f32) {
         self.current = val;
         self.target = val;
         self.velocity = 0.0;
     }
 
+    /// Updates the spring simulation step, returning true if still animating.
     pub fn update(&mut self, dt: f32) -> bool {
         let diff = self.target - self.current;
         if diff.abs() < 0.1 && self.velocity.abs() < 0.1 {
@@ -478,17 +494,20 @@ impl Spring {
     }
 }
 
+/// Scratchpad buffer for zero-allocation UTF-16 string conversion.
 struct D2DScratchpad {
     utf16_buf: Vec<u16>,
 }
 
 impl D2DScratchpad {
+    /// Creates a new UTF-16 conversion scratchpad.
     pub fn new() -> Self {
         Self {
             utf16_buf: Vec::with_capacity(1024),
         }
     }
 
+    /// Encodes a UTF-8 slice into the internal reusable UTF-16 buffer.
     #[inline]
     pub fn encode_utf16<'a>(&'a mut self, s: &str) -> &'a [u16] {
         self.utf16_buf.clear();
@@ -497,6 +516,7 @@ impl D2DScratchpad {
     }
 }
 
+/// Direct2D and DirectWrite rendering pipeline.
 pub struct Renderer {
     d2d_factory: ID2D1Factory,
     dwrite_factory: IDWriteFactory,
@@ -508,6 +528,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// Initializes Direct2D, DirectWrite factories, and icon caching.
     pub fn new(font_family: String) -> Result<Self> {
         unsafe {
             let d2d_factory: ID2D1Factory =
@@ -527,13 +548,16 @@ impl Renderer {
         }
     }
 
+    /// Updates the visual theme.
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
     }
 
+    /// Ensures the D2D render target context is initialized for the window handle.
+    ///
     /// # Safety
     ///
-    /// `hwnd` must be a valid top-level window handle on the UI thread.
+    /// `hwnd` must be a valid, active top-level window handle on the UI thread.
     pub unsafe fn ensure_context(&mut self, hwnd: HWND) -> Result<&mut D2DContext> {
         if self.context.is_none() {
             self.context = Some(unsafe { self.create_context(hwnd)? });
@@ -541,11 +565,13 @@ impl Renderer {
         Ok(self.context.as_mut().unwrap())
     }
 
+    /// Invalidates the device context and clears cached bitmaps on DPI/device loss.
     pub fn invalidate(&mut self) {
         self.context = None;
         self.icon_cache.cache.clear();
     }
 
+    /// Updates the UI font family and invalidates formats.
     pub fn set_font_family(&mut self, font_family: String) {
         if self.font_family != font_family {
             self.font_family = font_family;
@@ -553,6 +579,7 @@ impl Renderer {
         }
     }
 
+    /// Creates Direct2D render target, brushes, and DirectWrite text formats.
     unsafe fn create_context(&self, hwnd: HWND) -> Result<D2DContext> {
         unsafe {
             let mut rect = RECT::default();
@@ -713,6 +740,7 @@ impl Renderer {
         }
     }
 
+    /// Computes the pixel X offset for the text insertion caret using text layout hit-testing.
     pub fn calculate_caret_offset(&mut self, hwnd: HWND, text: &str) -> f32 {
         if text.is_empty() {
             return 0.0;
@@ -748,6 +776,8 @@ impl Renderer {
         }
     }
 
+    /// Renders the complete launcher UI frame with Direct2D.
+    ///
     /// # Safety
     ///
     /// `hwnd` must be an initialized and active window handle on the UI thread.
@@ -793,8 +823,6 @@ impl Renderer {
             let target: ID2D1RenderTarget = ctx.target.cast()?;
             target.BeginDraw();
 
-            // ponytail: target.GetSize() returns DIP size matching the dpiX/dpiY coordinate space;
-            // GetClientRect would return physical pixels and stretch all coordinates at >100% DPI.
             let dip_size = target.GetSize();
 
             target.Clear(Some(&D2D1_COLOR_F {
@@ -922,7 +950,6 @@ impl Renderer {
 
             let start_y = metrics::LIST_TOP;
 
-            // Viewport clipping: prevent items from bleeding into the header or outside rounded corners
             let clip_top = start_y + 0.5;
             let clip_bottom = dip_size.height - 0.5;
             let clip_rect = D2D_RECT_F {
@@ -933,11 +960,8 @@ impl Renderer {
             };
             target.PushAxisAlignedClip(&clip_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
-            // Compute floating-point visible range for smooth sub-pixel scrolling
             let item_h = metrics::ITEM_HEIGHT as f32;
             let first_idx = (scroll_y / item_h).floor() as usize;
-            // Overdraw: render 2 extra rows so sub-pixel scrolling never reveals a blank edge;
-            // the viewport clip culls the overflow. Pill is in absolute list coords, so minus scroll.
             let visual_pill_y = pill_y - scroll_y;
             let last_idx = (first_idx + max_results + 2).min(items.len());
 
@@ -962,7 +986,6 @@ impl Renderer {
                 .skip(first_idx)
                 .take(last_idx - first_idx)
             {
-                // Sub-pixel: use float global index directly, clip region handles frustum culling
                 let top = start_y + (global_i as f32) * item_h - scroll_y;
                 let bottom = top + item_h - 4.0;
 
@@ -981,9 +1004,6 @@ impl Renderer {
                     target.FillRoundedRectangle(&item_rect, &ctx.brushes.hover);
                 }
 
-                let is_calc = matches!(item.kind, ItemKind::Calculator { .. });
-                let is_mgmt = matches!(item.kind, ItemKind::AppMgmt);
-
                 let icon_container = D2D_RECT_F {
                     left: 20.0,
                     top: top + 9.0,
@@ -993,7 +1013,7 @@ impl Renderer {
                 let icon_fmt = &ctx.formats.badge_icon;
                 let badge_fmt = &ctx.formats.badge;
 
-                match &item.kind {
+                match item.kind {
                     ItemKind::AppMgmt => draw_badge(
                         &target,
                         &dwrite_factory,
@@ -1018,7 +1038,7 @@ impl Renderer {
                         &ctx.brushes.subtext,
                         is_nerd_font,
                     ),
-                    ItemKind::Calculator { .. } => draw_badge(
+                    ItemKind::Calculator => draw_badge(
                         &target,
                         &dwrite_factory,
                         icon_fmt,
@@ -1030,7 +1050,7 @@ impl Renderer {
                         &ctx.brushes.accent,
                         is_nerd_font,
                     ),
-                    ItemKind::Command { .. } => draw_badge(
+                    ItemKind::Command => draw_badge(
                         &target,
                         &dwrite_factory,
                         icon_fmt,
@@ -1108,7 +1128,7 @@ impl Renderer {
                 let text_max_right = dip_size.width - 185.0;
 
                 let title_w = scratch.encode_utf16(&item.name);
-                let title_brush = if is_calc {
+                let title_brush = if item.kind == ItemKind::Calculator {
                     &ctx.brushes.accent
                 } else {
                     &ctx.brushes.text
@@ -1143,12 +1163,10 @@ impl Renderer {
                 );
 
                 if global_i == selected {
-                    let action_str = if is_calc {
-                        KEY_CAP_COPY
-                    } else if matches!(item.kind, ItemKind::Clipboard) {
-                        KEY_CAP_PASTE
-                    } else {
-                        KEY_CAP_OPEN
+                    let action_str = match item.kind {
+                        ItemKind::Calculator => KEY_CAP_COPY,
+                        ItemKind::Clipboard => KEY_CAP_PASTE,
+                        _ => KEY_CAP_OPEN,
                     };
 
                     let action_rect = D2D1_ROUNDED_RECT {
@@ -1172,7 +1190,7 @@ impl Renderer {
                         DWRITE_MEASURING_MODE_NATURAL,
                     );
 
-                    if !is_calc && !is_mgmt {
+                    if item.supports_admin() {
                         let admin_w = KEY_CAP_ADMIN.as_wide();
                         let admin_rect = D2D1_ROUNDED_RECT {
                             rect: D2D_RECT_F {
@@ -1203,7 +1221,6 @@ impl Renderer {
                 }
             }
 
-            // Scrollbar indicator
             if items.len() > max_results && max_results > 0 {
                 let track_top = start_y + 4.0;
                 let list_h = (max_results as f32) * item_h + 8.0;

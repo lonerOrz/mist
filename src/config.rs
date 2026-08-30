@@ -15,7 +15,8 @@ use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 pub const HOTKEY_ID: i32 = 1001;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Application configuration structure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
@@ -40,29 +41,39 @@ pub struct Config {
 
     #[serde(default = "default_autostart")]
     pub autostart: bool,
+
+    #[serde(default)]
+    pub extra_paths: Vec<PathBuf>,
 }
 
 fn default_hotkey() -> String {
     "Alt+Space".into()
 }
+
 fn default_placeholder() -> String {
     "Search apps, commands, or calculate...".into()
 }
+
 fn default_max_results() -> usize {
     8
 }
+
 fn default_font() -> String {
     "Segoe UI Variable Display".into()
 }
+
 fn default_width() -> i32 {
     760
 }
+
 fn default_opacity() -> f32 {
     0.72
 }
+
 fn default_corner_radius() -> f32 {
     8.0
 }
+
 fn default_autostart() -> bool {
     false
 }
@@ -78,20 +89,24 @@ impl Default for Config {
             opacity: default_opacity(),
             corner_radius: default_corner_radius(),
             autostart: default_autostart(),
+            extra_paths: Vec::new(),
         }
     }
 }
 
 impl Config {
-    fn normalized(mut self) -> Self {
+    /// Clamps and sanitizes user-provided configuration values within safe bounds.
+    pub fn normalized(mut self) -> Self {
         self.width = self.width.clamp(400, 2000);
         self.max_results = self.max_results.clamp(1, 50);
         self.opacity = self.opacity.clamp(0.05, 1.0);
         self.corner_radius = self.corner_radius.clamp(0.0, 20.0);
+        self.extra_paths.retain(|p| !p.as_os_str().is_empty());
         self
     }
 }
 
+/// Returns the configuration directory path under %USERPROFILE%\.config\mist.
 pub fn get_mist_dir() -> PathBuf {
     let base = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
@@ -101,10 +116,12 @@ pub fn get_mist_dir() -> PathBuf {
     dir
 }
 
+/// Returns the full path to config.toml.
 pub fn get_config_path() -> PathBuf {
     get_mist_dir().join("config.toml")
 }
 
+/// Synchronizes the login autostart registry entry under HKCU\...\Run.
 pub fn sync_autostart(enable: bool) {
     unsafe {
         let Ok(current_exe) = std::env::current_exe() else {
@@ -155,22 +172,34 @@ corner_radius = 8.0
 
 # Launch Mist automatically at login (managed via HKCU\...\Run)
 autostart = false
+
+# Extra directories to index for custom scripts (.bat, .cmd, .ps1) and portable apps
+# e.g. extra_paths = ["D:\\Scripts", "C:\\Users\\yourname\\bin"]
+extra_paths = []
 "#;
 
 impl Config {
+    /// Safely loads configuration from disk, creating default file ONLY if it does not exist.
     pub fn load_or_create() -> Self {
         let path = get_config_path();
 
-        if let Ok(content) = fs::read_to_string(&path)
-            && let Ok(cfg) = toml::from_str::<Config>(&content)
-        {
-            return cfg.normalized();
+        if path.exists() {
+            match Self::load_from_file(&path) {
+                Ok(cfg) => return cfg,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to parse '{path:?}': {e}. Using fallback defaults without overwriting."
+                    );
+                    return Config::default();
+                }
+            }
         }
 
         let _ = fs::write(&path, DEFAULT_CONFIG_TEMPLATE);
         Config::default()
     }
 
+    /// Parses configuration from an explicit file path.
     pub fn load_from_file(path: &Path) -> Result<Self, String> {
         let content = fs::read_to_string(path)
             .map_err(|e| format!("Failed to read config file '{path:?}': {e}"))?;
@@ -179,6 +208,7 @@ impl Config {
             .map_err(|e| format!("Failed to parse TOML configuration: {e}"))
     }
 
+    /// Spawns a background file watcher that posts WM_CONFIG_RELOADED on config changes.
     pub fn watch_and_notify(hwnd: HWND, msg_id: u32) {
         let dir = get_mist_dir();
         let config_path = get_config_path();

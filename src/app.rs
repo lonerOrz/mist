@@ -2,8 +2,8 @@ use crate::clipboard::{ClipboardEntry, ClipboardListener};
 use crate::config::{Config, HOTKEY_ID};
 use crate::domain::Item;
 use crate::history::History;
+use crate::query;
 use crate::renderer::{Renderer, Spring, Theme, metrics, window_scale};
-use crate::router;
 use std::collections::VecDeque;
 use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
@@ -16,6 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const TIMER_ANIMATION: usize = 2;
 
+/// Central application state manager coordinating input, animations, and indexing.
 pub struct App {
     pub config: Config,
     pub index: Vec<Item>,
@@ -36,6 +37,7 @@ pub struct App {
 }
 
 impl App {
+    /// Creates and initializes the launcher application state.
     pub fn new(renderer: Renderer, config: Config) -> Self {
         let mut renderer = renderer;
         renderer.set_theme(Theme::from_config(&config));
@@ -59,10 +61,12 @@ impl App {
         }
     }
 
+    /// Replaces the global application index with newly scanned items.
     pub fn set_index(&mut self, items: Vec<Item>) {
         self.index = items;
     }
 
+    /// Applies newly loaded configuration, updating theme, dimensions, and hotkeys.
     pub fn update_config(&mut self, hwnd: HWND, new_config: Config) {
         if self.config.font_family != new_config.font_family {
             self.renderer
@@ -89,6 +93,7 @@ impl App {
         }
     }
 
+    /// Formats the query display text including in-progress IME composition strings.
     pub fn display_query(&self) -> String {
         if self.ime_comp.is_empty() {
             self.query.clone()
@@ -97,6 +102,7 @@ impl App {
         }
     }
 
+    /// Positions the Windows IME composition candidate window directly beneath the caret.
     pub fn update_ime_position(&mut self, hwnd: HWND) {
         unsafe {
             let himc = ImmGetContext(hwnd);
@@ -132,67 +138,73 @@ impl App {
         }
     }
 
+    /// Handles query string changes, re-routes results, and re-computes target window height.
     pub fn on_query_change(&mut self, hwnd: HWND) {
         self.pull_clipboard_updates();
         self.selected = 0;
         self.hovered = None;
         self.scroll_spring.reset(0.0);
-        self.results = router::route_query(
+        let cb_slice = self.clipboard_history.make_contiguous();
+        self.results = query::route_query(
             &self.query,
             &self.index,
             &self.history,
             &self.config,
-            self.clipboard_history.make_contiguous(),
+            cb_slice,
         );
         self.pill.reset(metrics::LIST_TOP);
         self.update_window_geometry(hwnd);
         self.update_ime_position(hwnd);
     }
+
+    /// Drains new clipboard entries from the background listener thread.
     pub fn pull_clipboard_updates(&mut self) {
-        let fresh: Vec<ClipboardEntry> = self.clipboard_listener.rx.try_iter().collect();
-        for entry in fresh {
+        while let Ok(entry) = self.clipboard_listener.rx.try_recv() {
             self.push_unique_front(entry);
         }
     }
 
+    /// Inserts a clipboard entry at the front, deduplicating identical entries and bounding capacity.
     fn push_unique_front(&mut self, entry: ClipboardEntry) {
         let hash = crate::clipboard::calculate_entry_hash(&entry);
-        // remove any existing entry with the same content, then move to front
         self.clipboard_history
             .retain(|e| crate::clipboard::calculate_entry_hash(e) != hash);
         self.clipboard_history.push_front(entry);
+        self.clipboard_history.truncate(500);
     }
+
+    /// Moves the selection cursor up with wrap-around.
     pub fn move_selection_up(&mut self, hwnd: HWND) {
         if self.results.is_empty() {
             return;
         }
-        if self.selected > 0 {
-            self.selected -= 1;
+        self.selected = if self.selected > 0 {
+            self.selected - 1
         } else {
-            // wrap-around: first item Up jumps to last item
-            self.selected = self.results.len() - 1;
-        }
+            self.results.len() - 1
+        };
         self.pill.set_target(metrics::list_item_top(self.selected));
-        self._adjust_scroll_for_selected();
+        self.adjust_scroll_for_selected();
         self.trigger_animation(hwnd);
     }
 
+    /// Moves the selection cursor down with wrap-around.
     pub fn move_selection_down(&mut self, hwnd: HWND) {
         if self.results.is_empty() {
             return;
         }
-        if self.selected + 1 < self.results.len() {
-            self.selected += 1;
+        self.selected = if self.selected + 1 < self.results.len() {
+            self.selected + 1
         } else {
-            // wrap-around: last item Down returns to first item
-            self.selected = 0;
-        }
+            0
+        };
         self.pill.set_target(metrics::list_item_top(self.selected));
-        self._adjust_scroll_for_selected();
+        self.adjust_scroll_for_selected();
         self.trigger_animation(hwnd);
     }
 
-    fn _adjust_scroll_for_selected(&mut self) {
+    /// Adjusts viewport scroll targets to keep the active selection visible.
+    fn adjust_scroll_for_selected(&mut self) {
         let item_h = metrics::ITEM_HEIGHT as f32;
         let visible = self.config.max_results;
         if visible == 0 || self.results.is_empty() {
@@ -201,12 +213,10 @@ impl App {
 
         let max_scroll = ((self.results.len().saturating_sub(visible)) as f32 * item_h).max(0.0);
 
-        // wrapped to item 0: snap viewport to top
         if self.selected == 0 {
             self.scroll_spring.set_target(0.0);
             return;
         }
-        // wrapped to last item: snap viewport to bottom
         if self.selected == self.results.len() - 1 {
             self.scroll_spring.set_target(max_scroll);
             return;
@@ -226,6 +236,7 @@ impl App {
         }
     }
 
+    /// Handles mouse movement events and updates hover highlighting.
     pub fn on_mouse_move(&mut self, hwnd: HWND, y: f32) {
         if self.results.is_empty() || y < metrics::LIST_TOP {
             if self.hovered.take().is_some() {
@@ -249,6 +260,7 @@ impl App {
         }
     }
 
+    /// Handles item click and admin badge click events.
     pub fn on_click(&mut self, hwnd: HWND, x: f32, y: f32) {
         if self.results.is_empty() || y < metrics::LIST_TOP {
             return;
@@ -259,12 +271,8 @@ impl App {
             self.selected = idx;
             self.pill.set_target(metrics::list_item_top(idx));
             let item = &self.results[idx];
-            let is_calc = matches!(item.kind, crate::domain::ItemKind::Calculator { .. });
-            let is_mgmt = matches!(item.kind, crate::domain::ItemKind::AppMgmt);
 
-            // unify click-area detection in metrics to avoid hardcoded magic numbers
-            if !is_calc
-                && !is_mgmt
+            if item.supports_admin()
                 && metrics::is_in_admin_button(idx, self.config.width as f32, x, y)
             {
                 self.execute_selected_admin(hwnd);
@@ -274,6 +282,7 @@ impl App {
         }
     }
 
+    /// Executes the active selected item under normal privileges.
     pub fn execute_selected(&mut self, hwnd: HWND) {
         if let Some(item) = self.results.get(self.selected) {
             let action = item.action.clone();
@@ -293,6 +302,7 @@ impl App {
         }
     }
 
+    /// Executes the active selected item with Administrator elevation.
     pub fn execute_selected_admin(&mut self, hwnd: HWND) {
         if let Some(item) = self.results.get(self.selected) {
             let action = item.action.clone();
@@ -312,6 +322,7 @@ impl App {
         }
     }
 
+    /// Hides the launcher window, clears input buffers, and returns physical working set memory.
     pub fn hide(&mut self, hwnd: HWND) {
         self.query.clear();
         self.query.shrink_to_fit();
@@ -344,11 +355,13 @@ impl App {
         }
     }
 
+    /// Updates animation physics step and renders the current frame to the Direct2D target.
     pub fn render_current_frame(&mut self, hwnd: HWND) {
         let pill_moving = !self.results.is_empty() && self.pill.update(1.0 / 60.0);
         let height_moving = self.height_spring.update(1.0 / 60.0);
         let scroll_moving = self.scroll_spring.update(1.0 / 60.0);
         self.spring_animating = pill_moving || height_moving || scroll_moving;
+
         if height_moving {
             let h = self.height_spring.current.round() as i32;
             let s = window_scale(hwnd);
@@ -364,6 +377,7 @@ impl App {
                 );
             }
         }
+
         let items: Vec<&Item> = self.results.iter().collect();
         let pill_y = if self.results.is_empty() {
             metrics::LIST_TOP
@@ -387,6 +401,7 @@ impl App {
         }
     }
 
+    /// Handles mouse wheel scrolling for search result lists.
     pub fn on_mouse_wheel(&mut self, hwnd: HWND, delta: i16) {
         let visible = self.config.max_results;
         if self.results.len() <= visible || visible == 0 {
@@ -395,12 +410,12 @@ impl App {
         let item_h = metrics::ITEM_HEIGHT as f32;
         let max_scroll = ((self.results.len() - visible) as f32) * item_h;
         let step = item_h * if delta > 0 { -1.0 } else { 1.0 };
-        let new_target = (self.scroll_spring.target + step).clamp(0.0, max_scroll);
-        self.scroll_spring.set_target(new_target);
-        // wheel only drives viewport scroll, never selected; Pill follows its item and viewport
+        self.scroll_spring
+            .set_target((self.scroll_spring.target + step).clamp(0.0, max_scroll));
         self.trigger_animation(hwnd);
     }
 
+    /// Activates the 60 FPS animation timer and triggers a client area repaint.
     pub fn trigger_animation(&mut self, hwnd: HWND) {
         self.spring_animating = true;
         unsafe {
@@ -409,6 +424,7 @@ impl App {
         }
     }
 
+    /// Recalculates the target height spring value based on result count.
     fn update_window_geometry(&mut self, hwnd: HWND) {
         let count = self.results.len().min(self.config.max_results);
         let new_h = if count == 0 {
