@@ -1,6 +1,7 @@
-use crate::domain::{Item, to_wide};
+use crate::domain::{Item, KeyKind, to_wide};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows::Win32::System::Registry::*;
@@ -85,32 +86,62 @@ fn ext_priority(path: &Path) -> u8 {
     }
 }
 
+/// Safely extracts an executable file path without breaking spaces in directory names.
+fn sanitize_exe_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(stripped) = trimmed.strip_prefix('"')
+        && let Some(end) = stripped.find('"')
+    {
+        return stripped[..end].to_string();
+    }
+
+    let lower = trimmed.to_lowercase();
+    for ext in [
+        ".exe", ".bat", ".cmd", ".msc", ".cpl", ".ps1", ".vbs", ".lnk",
+    ] {
+        if let Some(idx) = lower.find(ext) {
+            let end = idx + ext.len();
+            if end == trimmed.len() || trimmed.as_bytes().get(end) == Some(&b' ') {
+                return trimmed[..end].to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
 /// Scans directories in system PATH environment variable, keeping highest priority per stem.
 fn scan_system_path() -> Vec<Item> {
-    let Ok(path_var) = std::env::var("PATH") else {
-        return Vec::new();
-    };
+    let mut dirs_to_scan = Vec::new();
+
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir_str in path_var.split(';') {
+            let trimmed = dir_str.trim().trim_matches('"');
+            if !trimmed.is_empty() {
+                dirs_to_scan.push(PathBuf::from(trimmed));
+            }
+        }
+    }
+
+    let windows_apps = expand_env(r"%LOCALAPPDATA%\Microsoft\WindowsApps");
+    let win_apps_path = PathBuf::from(&windows_apps);
+    if win_apps_path.is_dir() && !dirs_to_scan.contains(&win_apps_path) {
+        dirs_to_scan.push(win_apps_path);
+    }
 
     let mut best_items: HashMap<String, (u8, Item)> = HashMap::new();
 
-    for dir_str in path_var.split(';') {
-        let trimmed = dir_str.trim().trim_matches('"');
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let dir = Path::new(trimmed);
+    for dir in dirs_to_scan {
         if !dir.is_dir() {
             continue;
         }
 
-        let Ok(entries) = std::fs::read_dir(dir) else {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file()
+            if !path.is_dir()
                 && is_valid_executable(&path)
                 && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
             {
@@ -148,21 +179,58 @@ pub fn scan_all(extra_paths: &[PathBuf]) -> Vec<Item> {
     });
 
     let total_hint = startmenu.len() + uwp.len() + app_paths.len() + custom.len() + sys_path.len();
-    let mut items = Vec::with_capacity(total_hint);
-
+    let mut items: Vec<Item> = Vec::with_capacity(total_hint);
+    let mut target_to_idx: HashMap<Box<str>, usize> = HashMap::new();
     let mut seen_names: HashSet<Box<str>> = HashSet::new();
-    let mut seen_targets: HashSet<Box<str>> = HashSet::new();
 
     for source in [startmenu, uwp, app_paths, custom, sys_path] {
-        for item in source {
+        for mut item in source {
             let name_key = item.name.to_lowercase().into_boxed_str();
             let target_key = get_canonical_target_key(&item).into_boxed_str();
 
-            if seen_targets.contains(&target_key) || seen_names.contains(&name_key) {
+            if let Some(&existing_idx) = target_to_idx.get(&target_key) {
+                let existing = &mut items[existing_idx];
+                let incoming_stem = Path::new(item.path.as_ref())
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&item.name)
+                    .to_lowercase();
+
+                if incoming_stem != existing.name.to_lowercase()
+                    && !existing
+                        .keys
+                        .iter()
+                        .any(|(_, k)| k.as_ref() == incoming_stem.as_str())
+                {
+                    let mut keys = existing.keys.as_ref().to_vec();
+                    keys.push((KeyKind::Alias, Arc::from(incoming_stem.as_str())));
+                    existing.keys = keys.into();
+                }
                 continue;
             }
 
-            seen_targets.insert(target_key);
+            if seen_names.contains(&name_key) {
+                continue;
+            }
+
+            if item.path.to_lowercase().ends_with(".lnk")
+                && let Some(target) = resolve_shortcut_target(Path::new(item.path.as_ref()))
+                && let Some(stem) = Path::new(&target).file_stem().and_then(|s| s.to_str())
+            {
+                let stem_lower = stem.to_lowercase();
+                if stem_lower != item.name.to_lowercase()
+                    && !item
+                        .keys
+                        .iter()
+                        .any(|(_, k)| k.as_ref() == stem_lower.as_str())
+                {
+                    let mut keys = item.keys.as_ref().to_vec();
+                    keys.push((KeyKind::Alias, Arc::from(stem_lower.as_str())));
+                    item.keys = keys.into();
+                }
+            }
+
+            target_to_idx.insert(target_key, items.len());
             seen_names.insert(name_key);
             items.push(item);
         }
@@ -265,17 +333,10 @@ fn scan_app_paths() -> Vec<Item> {
                     let val_w = to_wide(&val_path);
                     if let Ok(exe) = read_reg_string(hkey, PCWSTR(val_w.as_ptr()), w!("")) {
                         let expanded_exe = expand_env(&exe);
-                        if expanded_exe.is_empty() {
+                        let clean_path = sanitize_exe_path(&expanded_exe);
+                        if clean_path.is_empty() {
                             continue;
                         }
-                        let clean_path = if let Some(stripped) = expanded_exe.strip_prefix('"') {
-                            stripped.split('"').next().unwrap_or(&expanded_exe)
-                        } else {
-                            expanded_exe
-                                .split_whitespace()
-                                .next()
-                                .unwrap_or(&expanded_exe)
-                        };
 
                         let stem = Path::new(&name)
                             .file_stem()
@@ -284,7 +345,7 @@ fn scan_app_paths() -> Vec<Item> {
                             .to_lowercase();
 
                         if is_valid_executable(Path::new(&clean_path)) {
-                            items.push(Item::new_application(&stem, clean_path));
+                            items.push(Item::new_application(&stem, &clean_path));
                         }
                     }
                 }
@@ -451,7 +512,33 @@ fn scan_uwp_apps() -> Vec<Item> {
                             format!(r"shell:AppsFolder\{parsing_path}")
                         };
 
-                        items.push(Item::new_application(&display_name, &aumid_path));
+                        let mut uwp_item = Item::new_application(&display_name, &aumid_path);
+
+                        let mut extra_aliases = Vec::new();
+                        let aumid_lower = aumid_path.to_lowercase();
+                        if aumid_lower.contains("windowsterminal") {
+                            extra_aliases.push("wt");
+                            extra_aliases.push("terminal");
+                        } else if aumid_lower.contains("screensketch")
+                            || aumid_lower.contains("snippingtool")
+                        {
+                            extra_aliases.push("snip");
+                            extra_aliases.push("snippingtool");
+                        } else if aumid_lower.contains("calculator") {
+                            extra_aliases.push("calc");
+                        }
+
+                        if !extra_aliases.is_empty() {
+                            let mut keys = uwp_item.keys.as_ref().to_vec();
+                            for alias in extra_aliases {
+                                if !keys.iter().any(|(_, k)| k.as_ref() == alias) {
+                                    keys.push((KeyKind::Alias, Arc::from(alias)));
+                                }
+                            }
+                            uwp_item.keys = keys.into();
+                        }
+
+                        items.push(uwp_item);
                     }
                 }
             }

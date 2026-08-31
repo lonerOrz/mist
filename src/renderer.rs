@@ -34,11 +34,11 @@ pub mod metrics {
 
     /// Checks if a coordinate falls inside the Administrator action badge zone.
     #[inline]
-    pub fn is_in_admin_button(idx: usize, width: f32, x: f32, y: f32) -> bool {
-        let row_top = list_item_top(idx);
+    pub fn is_in_admin_button(idx: usize, width: f32, x: f32, y: f32, scroll_y: f32) -> bool {
+        let visual_row_top = list_item_top(idx) - scroll_y;
         let admin_min_x = width - ADMIN_ZONE_FAR as f32;
         let admin_max_x = width - ADMIN_ZONE_NEAR as f32;
-        let in_y = y >= row_top + 13.5 && y <= row_top + 36.5;
+        let in_y = y >= visual_row_top + 13.5 && y <= visual_row_top + 36.5;
         let in_x = x >= admin_min_x && x <= admin_max_x;
         in_y && in_x
     }
@@ -794,6 +794,7 @@ impl Renderer {
         pill_y: f32,
         max_results: usize,
         scroll_y: f32,
+        hovered_btn: Option<crate::app::ButtonKind>,
     ) -> Result<()> {
         unsafe {
             self.ensure_context(hwnd)?;
@@ -825,11 +826,13 @@ impl Renderer {
 
             let dip_size = target.GetSize();
 
+            // 严格预乘 Alpha (Premultiplied Alpha) 清屏
+            let a = theme.opacity;
             target.Clear(Some(&D2D1_COLOR_F {
-                r: 0.11,
-                g: 0.11,
-                b: 0.14,
-                a: theme.opacity,
+                r: 0.05 * a,
+                g: 0.06 * a,
+                b: 0.08 * a,
+                a,
             }));
 
             let win_rect = D2D_RECT_F {
@@ -1179,7 +1182,14 @@ impl Renderer {
                         radiusX: theme.button_radius,
                         radiusY: theme.button_radius,
                     };
-                    target.FillRoundedRectangle(&action_rect, &ctx.brushes.badge_bg);
+                    target.FillRoundedRectangle(
+                        &action_rect,
+                        if Some(crate::app::ButtonKind::Action) == hovered_btn {
+                            &ctx.brushes.hover
+                        } else {
+                            &ctx.brushes.badge_bg
+                        },
+                    );
                     target.DrawRoundedRectangle(&action_rect, &ctx.brushes.badge_border, 1.0, None);
                     target.DrawText(
                         action_str.as_wide(),
@@ -1202,7 +1212,14 @@ impl Renderer {
                             radiusX: theme.button_radius,
                             radiusY: theme.button_radius,
                         };
-                        target.FillRoundedRectangle(&admin_rect, &ctx.brushes.badge_bg);
+                        target.FillRoundedRectangle(
+                            &admin_rect,
+                            if Some(crate::app::ButtonKind::Admin) == hovered_btn {
+                                &ctx.brushes.hover
+                            } else {
+                                &ctx.brushes.badge_bg
+                            },
+                        );
                         target.DrawRoundedRectangle(
                             &admin_rect,
                             &ctx.brushes.badge_border,

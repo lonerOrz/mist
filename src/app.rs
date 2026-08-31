@@ -16,6 +16,13 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const TIMER_ANIMATION: usize = 2;
 
+/// Tracks which button zone the cursor is currently inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ButtonKind {
+    Action,
+    Admin,
+}
+
 /// Central application state manager coordinating input, animations, and indexing.
 pub struct App {
     pub config: Config,
@@ -25,6 +32,7 @@ pub struct App {
     pub results: Vec<Item>,
     pub selected: usize,
     pub hovered: Option<usize>,
+    pub hovered_btn: Option<ButtonKind>,
     pub caret_visible: bool,
     pub pill: Spring,
     pub height_spring: Spring,
@@ -49,6 +57,7 @@ impl App {
             results: Vec::new(),
             selected: 0,
             hovered: None,
+            hovered_btn: None,
             caret_visible: true,
             pill: Spring::new(metrics::LIST_TOP),
             height_spring: Spring::new_slow(metrics::HEADER_HEIGHT as f32, 0.22),
@@ -143,6 +152,7 @@ impl App {
         self.pull_clipboard_updates();
         self.selected = 0;
         self.hovered = None;
+        self.hovered_btn = None;
         self.scroll_spring.reset(0.0);
         let cb_slice = self.clipboard_history.make_contiguous();
         self.results = query::route_query(
@@ -237,23 +247,53 @@ impl App {
     }
 
     /// Handles mouse movement events and updates hover highlighting.
-    pub fn on_mouse_move(&mut self, hwnd: HWND, y: f32) {
+    pub fn on_mouse_move(&mut self, hwnd: HWND, x: f32, y: f32) {
         if self.results.is_empty() || y < metrics::LIST_TOP {
-            if self.hovered.take().is_some() {
+            if self.hovered.take().is_some() || self.hovered_btn.is_some() {
+                self.hovered_btn = None;
                 unsafe {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             return;
         }
-        let idx = ((y - metrics::LIST_TOP + self.scroll_spring.current)
-            / metrics::ITEM_HEIGHT as f32) as usize;
+        let item_h = metrics::ITEM_HEIGHT as f32;
+        let scroll = self.scroll_spring.current;
+        let idx = ((y - metrics::LIST_TOP + scroll) / item_h) as usize;
         if idx < self.results.len() {
             if self.hovered != Some(idx) {
                 self.hovered = Some(idx);
                 self.trigger_animation(hwnd);
             }
-        } else if self.hovered.take().is_some() {
+            let item = &self.results[idx];
+            let visual_top = metrics::list_item_top(idx) - scroll;
+            let in_y = y >= visual_top + 13.5 && y <= visual_top + 36.5;
+            if in_y {
+                let admin_min_x = self.config.width as f32 - metrics::ADMIN_ZONE_FAR as f32;
+                let admin_max_x = self.config.width as f32 - metrics::ADMIN_ZONE_NEAR as f32;
+                let action_min_x = self.config.width as f32 - 76.0;
+                let action_max_x = self.config.width as f32 - 16.0;
+                if item.supports_admin() && x >= admin_min_x && x <= admin_max_x {
+                    if self.hovered_btn != Some(ButtonKind::Admin) {
+                        self.hovered_btn = Some(ButtonKind::Admin);
+                        self.trigger_animation(hwnd);
+                    }
+                } else if x >= action_min_x && x <= action_max_x {
+                    if self.hovered_btn != Some(ButtonKind::Action) {
+                        self.hovered_btn = Some(ButtonKind::Action);
+                        self.trigger_animation(hwnd);
+                    }
+                } else if self.hovered_btn.is_some() {
+                    self.hovered_btn = None;
+                    self.trigger_animation(hwnd);
+                }
+            } else if self.hovered_btn.is_some() {
+                self.hovered_btn = None;
+                self.trigger_animation(hwnd);
+            }
+        } else {
+            self.hovered = None;
+            self.hovered_btn = None;
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
@@ -273,7 +313,13 @@ impl App {
             let item = &self.results[idx];
 
             if item.supports_admin()
-                && metrics::is_in_admin_button(idx, self.config.width as f32, x, y)
+                && metrics::is_in_admin_button(
+                    idx,
+                    self.config.width as f32,
+                    x,
+                    y,
+                    self.scroll_spring.current,
+                )
             {
                 self.execute_selected_admin(hwnd);
             } else {
@@ -332,6 +378,7 @@ impl App {
         self.results.shrink_to_fit();
         self.selected = 0;
         self.hovered = None;
+        self.hovered_btn = None;
         self.height_spring.reset(metrics::HEADER_HEIGHT as f32);
         self.pill.reset(metrics::LIST_TOP);
         self.scroll_spring.reset(0.0);
@@ -397,6 +444,7 @@ impl App {
                 pill_y,
                 self.config.max_results,
                 self.scroll_spring.current,
+                self.hovered_btn,
             );
         }
     }

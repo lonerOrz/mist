@@ -103,19 +103,22 @@ impl Action {
                 let (file, params, working_dir) =
                     if let Some(cmd) = path_str.strip_prefix("cmd.exe /k ") {
                         ("cmd.exe", format!("/k {cmd}"), String::new())
-                    } else if path_str.starts_with("shell:AppsFolder\\")
-                        || path_str.to_lowercase().ends_with(".lnk")
-                        || path_str.to_lowercase().ends_with(".url")
-                    {
-                        (path_str, String::new(), String::new())
                     } else {
-                        let target_path = Path::new(path_str);
-                        let dir = target_path
-                            .parent()
-                            .map(|p| p.to_string_lossy().to_string())
-                            .filter(|d| !d.is_empty() && !d.starts_with(r"\\"))
-                            .unwrap_or_default();
-                        (path_str, String::new(), dir)
+                        let path_lower = path_str.to_lowercase();
+                        if path_lower.starts_with("shell:appsfolder\\")
+                            || path_lower.ends_with(".lnk")
+                            || path_lower.ends_with(".url")
+                        {
+                            (path_str, String::new(), String::new())
+                        } else {
+                            let target_path = Path::new(path_str);
+                            let dir = target_path
+                                .parent()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .filter(|d| !d.is_empty() && !d.starts_with(r"\\"))
+                                .unwrap_or_default();
+                            (path_str, String::new(), dir)
+                        }
                     };
 
                 let file_w = to_wide(file);
@@ -365,51 +368,107 @@ pub struct Item {
     pub kind: ItemKind,
     pub priority_penalty: i32,
     pub action: Action,
-    pub keys: Box<[(KeyKind, Arc<str>)]>,
+    pub keys: Arc<[(KeyKind, Arc<str>)]>,
 }
 
 impl Item {
     /// Creates an application search item with generated Pinyin, Initials, and Alias keys.
     pub fn new_application(name: &str, path: &str) -> Self {
         let name_lower = name.to_lowercase();
-        let mut keys: Vec<(KeyKind, Arc<str>)> = Vec::with_capacity(4);
+        let mut keys: Vec<(KeyKind, Arc<str>)> = Vec::with_capacity(8);
         keys.push((KeyKind::Name, Arc::from(name_lower.as_str())));
 
-        let mut pinyin_joined = String::with_capacity(name.len() * 4);
-        let mut initials_chars: Vec<char> = Vec::with_capacity(name.len());
+        let mut py_variants: Vec<String> = vec![String::new()];
+        let mut in_variants: Vec<String> = vec![String::new()];
         let mut has_cjk = false;
         let mut prev_is_alphanumeric = false;
 
         for c in name.chars() {
             if c.is_ascii_alphanumeric() {
                 let lower = c.to_ascii_lowercase();
-                pinyin_joined.push(lower);
+                for py in &mut py_variants {
+                    py.push(lower);
+                }
                 if !prev_is_alphanumeric {
-                    initials_chars.push(lower);
+                    for init in &mut in_variants {
+                        init.push(lower);
+                    }
                 }
                 prev_is_alphanumeric = true;
             } else if let Some(multi) = c.to_pinyin_multi() {
                 has_cjk = true;
                 prev_is_alphanumeric = false;
-                if let Some(first_py) = multi.into_iter().next() {
-                    let plain = first_py.plain();
-                    pinyin_joined.push_str(plain);
-                    if let Some(first_char) = plain.chars().next() {
-                        initials_chars.push(first_char);
+
+                let mut py_list = Vec::new();
+                let mut init_list = Vec::new();
+                for p in multi {
+                    let plain = p.plain();
+                    if !py_list.contains(&plain) {
+                        py_list.push(plain);
+                    }
+                    if let Some(first) = plain.chars().next()
+                        && !init_list.contains(&first)
+                    {
+                        init_list.push(first);
                     }
                 }
+
+                let mut new_py = Vec::new();
+                for base in &py_variants {
+                    for py in &py_list {
+                        if new_py.len() < 8 {
+                            let mut s = base.clone();
+                            s.push_str(py);
+                            new_py.push(s);
+                        }
+                    }
+                }
+                py_variants = new_py;
+
+                let mut new_in = Vec::new();
+                for base in &in_variants {
+                    for init in &init_list {
+                        if new_in.len() < 8 {
+                            let mut s = base.clone();
+                            s.push(*init);
+                            new_in.push(s);
+                        }
+                    }
+                }
+                in_variants = new_in;
             } else {
                 prev_is_alphanumeric = false;
             }
         }
 
-        if has_cjk && !pinyin_joined.is_empty() {
-            keys.push((KeyKind::Pinyin, Arc::from(pinyin_joined.as_str())));
+        if has_cjk {
+            for py in py_variants {
+                if !py.is_empty() && !keys.iter().any(|(_, k)| k.as_ref() == py.as_str()) {
+                    keys.push((KeyKind::Pinyin, Arc::from(py.as_str())));
+                }
+            }
+            for init in &in_variants {
+                if init.len() >= 2
+                    && *init != name_lower
+                    && !keys.iter().any(|(_, k)| k.as_ref() == init.as_str())
+                {
+                    keys.push((KeyKind::Initials, Arc::from(init.as_str())));
+                }
+            }
         }
-        let initials_str: String = initials_chars.into_iter().collect();
-        if initials_str.len() >= 2 && initials_str != name_lower {
-            keys.push((KeyKind::Initials, Arc::from(initials_str.as_str())));
+
+        // Always include initials for ASCII text (no multi-tone chars needed)
+        if !has_cjk {
+            let ascii_initials: String = in_variants
+                .iter()
+                .filter(|s| s.len() >= 2 && **s != name_lower)
+                .cloned()
+                .collect();
+            if !ascii_initials.is_empty() {
+                keys.push((KeyKind::Initials, Arc::from(ascii_initials.as_str())));
+            }
         }
+
         if !path.starts_with("shell:")
             && let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str())
         {
@@ -420,6 +479,7 @@ impl Item {
                 keys.push((KeyKind::Alias, Arc::from(stem_lower)));
             }
         }
+
         let path_arc: Arc<str> = Arc::from(path);
         Self {
             name: Arc::from(name),
@@ -430,7 +490,7 @@ impl Item {
                 path: path_arc,
                 verb: None,
             },
-            keys: keys.into_boxed_slice(),
+            keys: keys.into(),
         }
     }
 
@@ -439,7 +499,7 @@ impl Item {
         let res_arc: Arc<str> = Arc::from(result);
         Self {
             name: Arc::from(format!("= {result}")),
-            keys: Box::new([]),
+            keys: Arc::new([]),
             path: Arc::from("Result (press Enter to copy)"),
             kind: ItemKind::Calculator,
             priority_penalty: 0,
@@ -457,7 +517,7 @@ impl Item {
             };
         Self {
             name: Arc::from(format!("Run command: {raw_cmd}")),
-            keys: Box::new([]),
+            keys: Arc::new([]),
             path: Arc::from(format!("Execute in command prompt: {raw_cmd}")),
             kind: ItemKind::Command,
             priority_penalty: 0,
@@ -480,7 +540,7 @@ impl Item {
                 path: url_arc,
                 verb: None,
             },
-            keys: Box::new([]),
+            keys: Arc::new([]),
         }
     }
 
@@ -496,7 +556,7 @@ impl Item {
                 path: path_arc,
                 verb: Some("explore"),
             },
-            keys: Box::new([]),
+            keys: Arc::new([]),
         }
     }
 
@@ -508,7 +568,7 @@ impl Item {
             kind: ItemKind::Clipboard,
             priority_penalty: 0,
             action: Action::PasteText(full_text.clone()),
-            keys: Box::new([(KeyKind::Name, full_text)]),
+            keys: Arc::new([(KeyKind::Name, full_text)]),
         }
     }
 
@@ -520,7 +580,7 @@ impl Item {
             kind: ItemKind::Clipboard,
             priority_penalty: 0,
             action: Action::PasteFiles(paths),
-            keys: Box::new([(KeyKind::Name, summary)]),
+            keys: Arc::new([(KeyKind::Name, summary)]),
         }
     }
 
@@ -536,7 +596,7 @@ impl Item {
             kind: ItemKind::System,
             priority_penalty: 0,
             action,
-            keys: keys.into_boxed_slice(),
+            keys: keys.into(),
         }
     }
 
@@ -552,7 +612,7 @@ impl Item {
             kind: ItemKind::AppMgmt,
             priority_penalty: 0,
             action,
-            keys: keys.into_boxed_slice(),
+            keys: keys.into(),
         }
     }
 

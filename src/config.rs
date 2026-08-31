@@ -67,7 +67,7 @@ fn default_width() -> i32 {
 }
 
 fn default_opacity() -> f32 {
-    0.72
+    0.45
 }
 
 fn default_corner_radius() -> f32 {
@@ -165,7 +165,7 @@ font_family = "Segoe UI Variable Display"
 width = 760
 
 # Background tint opacity over the acrylic backdrop (0.05 - 1.0)
-opacity = 0.72
+opacity = 0.45
 
 # Corner radius in pixels (0.0 - 20.0, inner elements scale with it)
 corner_radius = 8.0
@@ -310,7 +310,7 @@ mod tests {
     fn defaults_are_normalized() {
         let cfg = Config::default().normalized();
         assert_eq!(cfg.width, 760);
-        assert!((cfg.opacity - 0.72).abs() < f32::EPSILON);
+        assert!((cfg.opacity - 0.45).abs() < f32::EPSILON);
         assert!((cfg.corner_radius - 8.0).abs() < f32::EPSILON);
     }
 }

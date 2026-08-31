@@ -110,6 +110,64 @@ fn apply_corner(hwnd: HWND, radius: f32) {
     };
 }
 
+#[repr(C)]
+struct AccentPolicy {
+    accent_state: u32,
+    accent_flags: u32,
+    gradient_color: u32,
+    animation_id: u32,
+}
+
+#[repr(C)]
+struct WindowCompositionAttrData {
+    attribute: u32,
+    data: *mut std::ffi::c_void,
+    size: usize,
+}
+
+/// Applies real-time frosted glass backdrop blur to the target window (Hyprland-style).
+unsafe fn apply_backdrop_blur(hwnd: HWND) {
+    use windows::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows::core::s;
+    use windows::core::w;
+
+    const DWMSBT_TRANSIENTWINDOW: i32 = 3;
+    let backdrop_type = DWMSBT_TRANSIENTWINDOW;
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &backdrop_type as *const _ as *const _,
+            4,
+        );
+    }
+
+    let user32 = unsafe { GetModuleHandleW(w!("user32.dll")).unwrap_or_default() };
+    if !user32.is_invalid()
+        && let Some(func) = unsafe { GetProcAddress(user32, s!("SetWindowCompositionAttribute")) }
+    {
+        type SetWindowCompositionAttributeFn =
+            unsafe extern "system" fn(HWND, *mut WindowCompositionAttrData) -> BOOL;
+        let set_wca: SetWindowCompositionAttributeFn = unsafe { std::mem::transmute(func) };
+
+        let mut policy = AccentPolicy {
+            accent_state: 3,
+            accent_flags: 0,
+            gradient_color: 0,
+            animation_id: 0,
+        };
+        let mut data = WindowCompositionAttrData {
+            attribute: 19,
+            data: &mut policy as *mut _ as *mut std::ffi::c_void,
+            size: std::mem::size_of::<AccentPolicy>(),
+        };
+        unsafe {
+            let _ = set_wca(hwnd, &mut data);
+        }
+    }
+}
+
 /// Application entry point: initializes Win32 subsystem, DPI awareness, DWM acrylic window, and starts message pump.
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -159,7 +217,7 @@ fn main() -> Result<()> {
         let default_cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
 
         let wnd_class = WNDCLASSW {
-            style: CS_DROPSHADOW,
+            style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wnd_proc),
             hInstance: instance.into(),
             lpszClassName: class_name,
@@ -202,15 +260,7 @@ fn main() -> Result<()> {
         );
 
         apply_corner(hwnd, config.corner_radius);
-
-        const DWMSBT_TRANSIENTWINDOW: i32 = 3;
-        let backdrop_type = DWMSBT_TRANSIENTWINDOW;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_SYSTEMBACKDROP_TYPE,
-            &backdrop_type as *const _ as *const _,
-            4,
-        );
+        apply_backdrop_blur(hwnd);
 
         let margins = MARGINS {
             cxLeftWidth: -1,
@@ -614,8 +664,10 @@ unsafe extern "system" fn wnd_proc(
 
         WM_MOUSEMOVE => {
             if let Some(app) = app_opt {
-                let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32 / window_scale(hwnd);
-                app.on_mouse_move(hwnd, y);
+                let s = window_scale(hwnd);
+                let x = (lparam.0 & 0xffff) as i16 as f32 / s;
+                let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32 / s;
+                app.on_mouse_move(hwnd, x, y);
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                     dwFlags: TME_LEAVE,
@@ -632,6 +684,7 @@ unsafe extern "system" fn wnd_proc(
         WM_MOUSELEAVE => {
             if let Some(app) = app_opt {
                 app.hovered = None;
+                app.hovered_btn = None;
                 unsafe {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
@@ -752,6 +805,7 @@ unsafe fn toggle_window(hwnd: HWND) {
                 app.results.clear();
                 app.selected = 0;
                 app.hovered = None;
+                app.hovered_btn = None;
                 app.caret_visible = true;
                 app.height_spring.reset(metrics::HEADER_HEIGHT as f32);
                 app.pill.reset(metrics::LIST_TOP);
@@ -792,6 +846,7 @@ unsafe fn toggle_window(hwnd: HWND) {
                     app.pill.current,
                     app.config.max_results,
                     app.scroll_spring.current,
+                    app.hovered_btn,
                 );
             }
             let _ = ShowWindow(hwnd, SW_SHOW);
