@@ -1,5 +1,5 @@
 use crate::domain::{Item, to_wide};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
@@ -7,7 +7,7 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 use windows::core::*;
 
-/// Runs a closure inside a multithreaded COM apartment scope.
+/// Executes a closure within a multithreaded COM apartment.
 fn scoped_com<T>(f: impl FnOnce() -> T) -> T {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -19,36 +19,160 @@ fn scoped_com<T>(f: impl FnOnce() -> T) -> T {
     r
 }
 
-/// Scans Start Menu, Desktop, UWP apps, App Paths, and custom directories concurrently.
+/// Resolves the destination target path of a Windows .lnk shortcut.
+fn resolve_shortcut_target(lnk_path: &Path) -> Option<String> {
+    unsafe {
+        let shell_link: IShellLinkW =
+            CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        let persist_file: IPersistFile = shell_link.cast().ok()?;
+
+        let wide_path = to_wide(&lnk_path.to_string_lossy());
+        persist_file
+            .Load(PCWSTR(wide_path.as_ptr()), STGM_READ)
+            .ok()?;
+
+        let mut path_buf = [0u16; 1024];
+        shell_link
+            .GetPath(&mut path_buf, std::ptr::null_mut(), 0)
+            .ok()?;
+
+        let len = path_buf
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(path_buf.len());
+        let target = String::from_utf16_lossy(&path_buf[..len]);
+        if target.is_empty() {
+            None
+        } else {
+            Some(target)
+        }
+    }
+}
+
+/// Computes the canonical physical execution key used for deduplication.
+fn get_canonical_target_key(item: &Item) -> String {
+    let path_str = item.path.as_ref();
+    let lower = path_str.to_lowercase();
+
+    if lower.starts_with("shell:appsfolder\\") {
+        return lower;
+    }
+
+    let p = Path::new(path_str);
+    if lower.ends_with(".lnk")
+        && let Some(target) = resolve_shortcut_target(p)
+    {
+        return target.to_lowercase();
+    }
+
+    lower
+}
+
+/// Returns execution priority score based on file extension.
+fn ext_priority(path: &Path) -> u8 {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("exe") => 5,
+        Some("lnk") | Some("appref-ms") => 4,
+        Some("cmd") | Some("bat") => 3,
+        Some("ps1") => 2,
+        Some("msc") | Some("cpl") => 1,
+        _ => 0,
+    }
+}
+
+/// Scans directories in system PATH environment variable, keeping highest priority per stem.
+fn scan_system_path() -> Vec<Item> {
+    let Ok(path_var) = std::env::var("PATH") else {
+        return Vec::new();
+    };
+
+    let mut best_items: HashMap<String, (u8, Item)> = HashMap::new();
+
+    for dir_str in path_var.split(';') {
+        let trimmed = dir_str.trim().trim_matches('"');
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let dir = Path::new(trimmed);
+        if !dir.is_dir() {
+            continue;
+        }
+
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && is_valid_executable(&path)
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            {
+                let stem_lower = stem.to_lowercase();
+                let priority = ext_priority(&path);
+                match best_items.get(&stem_lower) {
+                    Some((existing_pri, _)) if *existing_pri >= priority => {}
+                    _ => {
+                        let item = Item::new_application(stem, path.to_string_lossy().as_ref());
+                        best_items.insert(stem_lower, (priority, item));
+                    }
+                }
+            }
+        }
+    }
+
+    best_items.into_values().map(|(_, item)| item).collect()
+}
+
+/// Concurrently scans all application sources and deduplicates by target path and name.
 pub fn scan_all(extra_paths: &[PathBuf]) -> Vec<Item> {
-    let (startmenu, uwp, app_paths, custom) = std::thread::scope(|s| {
+    let (startmenu, uwp, app_paths, custom, sys_path) = std::thread::scope(|s| {
         let b = s.spawn(|| scoped_com(scan_start_menu_and_desktop));
         let c = s.spawn(|| scoped_com(scan_uwp_apps));
         let d = s.spawn(scan_app_paths);
         let e = s.spawn(|| scan_custom_paths(extra_paths));
+        let p = s.spawn(scan_system_path);
         (
             b.join().unwrap_or_default(),
             c.join().unwrap_or_default(),
             d.join().unwrap_or_default(),
             e.join().unwrap_or_default(),
+            p.join().unwrap_or_default(),
         )
     });
 
-    let mut items =
-        Vec::with_capacity(startmenu.len() + uwp.len() + app_paths.len() + custom.len());
-    let mut seen_keys: HashSet<Box<str>> = HashSet::new();
+    let total_hint = startmenu.len() + uwp.len() + app_paths.len() + custom.len() + sys_path.len();
+    let mut items = Vec::with_capacity(total_hint);
 
-    for source in [startmenu, uwp, app_paths, custom] {
+    let mut seen_names: HashSet<Box<str>> = HashSet::new();
+    let mut seen_targets: HashSet<Box<str>> = HashSet::new();
+
+    for source in [startmenu, uwp, app_paths, custom, sys_path] {
         for item in source {
-            if seen_keys.insert(item.name.to_lowercase().into_boxed_str()) {
-                items.push(item);
+            let name_key = item.name.to_lowercase().into_boxed_str();
+            let target_key = get_canonical_target_key(&item).into_boxed_str();
+
+            if seen_targets.contains(&target_key) || seen_names.contains(&name_key) {
+                continue;
             }
+
+            seen_targets.insert(target_key);
+            seen_names.insert(name_key);
+            items.push(item);
         }
     }
+
+    items.shrink_to_fit();
     items
 }
 
-/// Expands %VARIABLE% environment variables in a path string.
+/// Expands environment variable tokens in a path string.
 fn expand_env(s: &str) -> String {
     if !s.contains('%') {
         return s.to_string();
@@ -63,7 +187,7 @@ fn expand_env(s: &str) -> String {
     }
 }
 
-/// Scans user-configured extra directories for scripts and executables.
+/// Scans user-configured custom paths for runnable files.
 fn scan_custom_paths(paths: &[PathBuf]) -> Vec<Item> {
     let mut items = Vec::new();
     for p in paths {
@@ -76,7 +200,7 @@ fn scan_custom_paths(paths: &[PathBuf]) -> Vec<Item> {
     items
 }
 
-/// Recursively scans custom directories up to a maximum depth of 3 levels.
+/// Recursively scans custom directories up to a depth of 3.
 fn walk_custom_directory(dir: &Path, out: &mut Vec<Item>, depth: usize) {
     if depth > 3 {
         return;
@@ -230,7 +354,7 @@ fn is_valid_executable(path: &Path) -> bool {
     VALID_EXTS.iter().any(|&v| v.eq_ignore_ascii_case(ext))
 }
 
-/// Scans all user and common Start Menu / Desktop directories.
+/// Scans user and public Start Menu and Desktop folders.
 fn scan_start_menu_and_desktop() -> Vec<Item> {
     let mut items = Vec::new();
     for id in [
@@ -248,7 +372,7 @@ fn scan_start_menu_and_desktop() -> Vec<Item> {
     items
 }
 
-/// Retrieves the filesystem path for a Windows Known Folder GUID.
+/// Resolves the filesystem path for a Windows Known Folder GUID.
 fn known_folder_path(id: &GUID) -> Option<PathBuf> {
     unsafe {
         let path = SHGetKnownFolderPath(id, KNOWN_FOLDER_FLAG(0), None).ok()?;
@@ -258,7 +382,7 @@ fn known_folder_path(id: &GUID) -> Option<PathBuf> {
     }
 }
 
-/// Recursively traverses a folder hierarchy up to depth 6 to collect executable files.
+/// Recursively traverses a directory up to depth 6 to collect executable files.
 fn walk_directory(dir: &Path, out: &mut Vec<Item>, depth: usize) {
     if depth > 6 {
         return;
