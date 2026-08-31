@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::DataExchange::*;
 use windows::Win32::System::Memory::*;
+use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows::Win32::System::Ole::*;
 use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::UI::Shell::*;
@@ -17,6 +18,26 @@ use windows::core::*;
 /// Encodes a UTF-8 string into a null-terminated UTF-16 wide string vector.
 pub(crate) fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Expands %VARIABLE% and ~ tokens into an absolute filesystem path.
+pub fn expand_env(s: &str) -> String {
+    let mut input = s.to_string();
+    if input.starts_with('~')
+        && let Ok(home) = std::env::var("USERPROFILE") {
+            input = format!("{}{}", home, &input[1..]);
+        }
+    if !input.contains('%') {
+        return input;
+    }
+    let wide = to_wide(&input);
+    let mut buf = [0u16; 1024];
+    unsafe {
+        let n = ExpandEnvironmentStringsW(PCWSTR(wide.as_ptr()), Some(&mut buf));
+        String::from_utf16_lossy(&buf[..n as usize])
+            .trim_end_matches('\0')
+            .to_string()
+    }
 }
 
 /// Represents the executable action associated with a search item.

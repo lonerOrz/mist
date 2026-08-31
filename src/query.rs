@@ -104,7 +104,13 @@ pub fn route_query(
         QueryIntent::Clipboard { filter } => query_clipboard(clipboard_history, filter),
         QueryIntent::System { subcmd } => query_system(subcmd),
         QueryIntent::AppMgmt { subcmd } => query_app_mgmt(subcmd),
-        QueryIntent::PathNavigation(path_str) => vec![Item::new_path("Open Folder", path_str)],
+        QueryIntent::PathNavigation(path_str) => {
+            let expanded = crate::domain::expand_env(path_str);
+            vec![Item::new_path(
+                &format!("Open Folder: {expanded}"),
+                &expanded,
+            )]
+        }
         QueryIntent::AppSearch(q) => search_top_k(index, q, history),
     }
 }
@@ -317,6 +323,10 @@ pub fn is_filesystem_path(q: &str) -> bool {
     if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
         return b.len() == 2 || b[2] == b'\\' || b[2] == b'/';
     }
+    // Support env var syntax (%LOCALAPPDATA%, %APPDATA%\xxx) and ~ (user home)
+    if (q.starts_with('%') && q.len() >= 3) || q.starts_with('~') {
+        return true;
+    }
     q.starts_with(r"\\") || q.starts_with("//")
 }
 
@@ -451,5 +461,10 @@ mod tests {
         assert!(is_filesystem_path("D:/Tools"));
         assert!(is_filesystem_path(r"\\Server\Share"));
         assert!(!is_filesystem_path("code.exe"));
+        assert!(is_filesystem_path("%LOCALAPPDATA%"));
+        assert!(is_filesystem_path(r"%APPDATA%\Microsoft"));
+        assert!(is_filesystem_path("~/Downloads"));
+        assert!(is_filesystem_path("~"));
+        assert!(!is_filesystem_path("%"));
     }
 }
